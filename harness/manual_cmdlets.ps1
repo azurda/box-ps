@@ -424,6 +424,34 @@ function New-Object {
         # Return stubbed installer object.
         return ([SERVICE]::new())
     }
+
+    if ($className -eq "winhttp.winhttprequest.5.1") {
+        # Stubbed class.
+        class WINHTTP {
+            [int] $Status
+            [byte[]] $ResponseBody
+            
+            WINHTTP() {
+                $this.Status = 200
+                $this.ResponseBody = [System.Text.Encoding]::ASCII.GetBytes("Write-Host 'EXECUTED EMBEDDED EXE'")
+            }
+            
+            Open([string]$method, [string]$url, [bool]$async) {
+                $behaviors = @("network")
+                $subBehaviors = @()
+                $behaviorProps = @{
+                    "uri" = $url
+                }
+                RecordAction $([Action]::new($behaviors, $subBehaviors, "WinHTTP.WinHTTPRequest.Open", $behaviorProps, @{}, "", ""))
+            }
+            
+            Send() {
+                # Do nothing
+            }
+        }
+
+        return ([WINHTTP]::new())
+    }
     
     if ($(GetOverridedClasses).Contains($className)) {
 	return RedirectObjectCreation $TypeName $ArgumentList
@@ -511,11 +539,9 @@ function Add-Type {
 	[Parameter(ParameterSetName="FromLiteralPath",Mandatory=$true)]
 	[Alias("PSPath, LP")]
 	[string[]] $LiteralPath,
-	[Parameter(ParameterSetName="FromMember",Mandatory=$true)]
-	[Parameter(Position=1)]
+	[Parameter(ParameterSetName="FromMember", Mandatory=$true, Position=1)]
 	[string[]] $MemberDefinition,
-	[Parameter(ParameterSetName="FromMember",Mandatory=$true)]
-	[Parameter(Position=0)]
+	[Parameter(ParameterSetName="FromMember", Mandatory=$true, Position=0)]
 	[string] $Name,
 	[Parameter(ParameterSetName="FromMember")]
 	[Alias("NS")]
@@ -545,8 +571,7 @@ function Add-Type {
 	[Parameter(ParameterSetName="FromLiteralPath")]
 	[Alias("RA")]
 	[string[]] $ReferencedAssemblies,
-	[Parameter(ParameterSetName="FromSource",Mandatory=$true)]
-	[Parameter(Position=0)]
+	[Parameter(ParameterSetName="FromSource", Mandatory=$true, Position=0)]
 	[string] $TypeDefinition,
 	[Parameter(ParameterSetName="FromMember")]
 	[Alias("Using")]
@@ -1306,7 +1331,7 @@ function Convert-String {
 
 # Fake the result of Get-Location.
 function Get-Location {
-    return "\C_DRIVE\Users\victim\AppData\Local\Temp";
+    return "C_DRIVE\Users\victim\AppData\Local\Temp";
 }
 
 # A function that does nothing. Used to override commands/cmdlets that
@@ -1572,3 +1597,59 @@ function Resolve-DnsName {
 
     RecordAction $([Action]::new($behaviors, $subBehaviors, "Resolve-DnsName", $behaviorProps, $MyInvocation, ""))
 }
+
+# Hook Start-Job to prevent process escaping and run synchronously
+function Start-Job {
+    param(
+        [Parameter(Mandatory=$true)]
+        [scriptblock]$ScriptBlock,
+        [parameter(ValueFromPipeline=$true)]
+        $InputObject,
+        $ArgumentList
+    )
+    Write-Host "[MCP-HOOK] Intercepted Start-Job. Redirecting to synchronous execution."
+    
+    $behaviors = @("process")
+    $subBehaviors = @("spawn_process")
+    $behaviorProps = @{
+        "script" = $ScriptBlock.ToString();
+    }
+    RecordAction $([Action]::new($behaviors, $subBehaviors, "Start-Job", $behaviorProps, $MyInvocation, ""))
+
+    if ($ArgumentList) {
+        & $ScriptBlock @ArgumentList
+    } else {
+        & $ScriptBlock
+    }
+}
+
+function Join-Path {
+    [cmdletbinding(DefaultParameterSetName="Path")]
+    param(
+        [Parameter(Position=0, Mandatory=$true, ValueFromPipeline=$true, ValueFromPipelineByPropertyName=$true)]
+        [string[]] $Path,
+        
+        [Parameter(Position=1, Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [string] $ChildPath,
+        
+        [switch] $Resolve,
+        [switch] $AdditionalChildPath
+    )
+    
+    # Clean C: drive prefix from Path to prevent Linux PSDrive crash
+    $cleanPaths = @()
+    foreach ($p in $Path) {
+        $clean = $p -replace "^[a-zA-Z]:", ""
+        $clean = $clean -replace "^[\\\/]", "" # Strip leading slash if any
+        $cleanPaths += $clean
+    }
+    
+    # Call the real Microsoft.PowerShell.Management\Join-Path with clean paths
+    $params = @{}
+    $params["Path"] = $cleanPaths
+    $params["ChildPath"] = $ChildPath
+    if ($PSBoundParameters.ContainsKey("Resolve")) { $params["Resolve"] = $Resolve }
+    
+    return Microsoft.PowerShell.Management\Join-Path @params
+}
+

@@ -11,6 +11,7 @@ using namespace NewtonSoft.Json
 using namespace System
 
 $WORK_DIR = "./working_<PID>"
+$global:WORK_DIR = $WORK_DIR
 $CODE_DIR = "<CODE_DIR>"
 $BOXPS_CONFIG = Microsoft.PowerShell.Management\Get-Content "$CODE_DIR/config.json" | ConvertFrom-Json -AsHashtable
 
@@ -59,7 +60,11 @@ class Action <# lawsuit... I'll be here all week #> {
         $this.Actor = $Actor
         $this.BehaviorProps = $BehaviorProps
         $this.Parameters = $BoundParams
-        $this.Line = $Line.Trim()
+        if ($null -ne $Line) {
+            $this.Line = $Line.Trim()
+        } else {
+            $this.Line = ""
+        }
         $this.ExtraInfo = $ExtraInfo
         $this.Id = 0
         $this.BehaviorId = $this.GetBehaviorId()
@@ -130,12 +135,16 @@ function RecordAction {
         [Action] $Action
     )
     
+    $wd = $WORK_DIR
+    if ($null -eq $wd -or $wd -eq "") { $wd = $global:WORK_DIR }
+    if ($null -eq $wd -or $wd -eq "") { $wd = "." }
+
     # read and update the running action id on disk
-    $Action.Id = [int](Microsoft.PowerShell.Management\Get-Content -Raw "$WORK_DIR/action_id.txt")
-    ($Action.Id + 1) | Out-File "$WORK_DIR/action_id.txt"
+    $Action.Id = [int](Microsoft.PowerShell.Management\Get-Content -Raw "$wd/action_id.txt")
+    ($Action.Id + 1) | Out-File "$wd/action_id.txt"
 
     $json = $Action | ConvertTo-Json -Depth 5
-    ($json + ",") | Out-File -Append "$WORK_DIR/actions.json"
+    ($json + ",") | Out-File -Append "$wd/actions.json"
 }
 
 function RedirectObjectCreation {
