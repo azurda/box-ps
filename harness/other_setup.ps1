@@ -93,3 +93,9 @@ foreach ($path in $commonSandboxPaths) {
     }
 }
 
+# Hijack Type Accelerators for Windows Identity and Principal
+$accelerators = [PowerShell]::Create().AddScript("[PowerShell].Assembly.GetType('System.Management.Automation.TypeAccelerators')").Invoke()[0]
+$accelerators::Add("Security.Principal.WindowsIdentity", [BoxPSWindowsIdentity])
+$accelerators::Add("Security.Principal.WindowsPrincipal", [BoxPSWindowsPrincipal])
+
+

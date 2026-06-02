@@ -10,6 +10,41 @@ using namespace Microsoft.PowerShell
 using namespace NewtonSoft.Json
 using namespace System
 
+class BoxPSSecurityIdentifier {
+    [string] $Value
+    BoxPSSecurityIdentifier([string] $v) { $this.Value = $v }
+}
+
+class BoxPSWindowsIdentity {
+    [string] $Name
+    [object[]] $Groups
+
+    BoxPSWindowsIdentity() {
+        $this.Name = "LEGITMACHINE01\LEGITUSER"
+        $this.Groups = @([BoxPSSecurityIdentifier]::new("S-1-5-32-544"))
+    }
+
+    static [BoxPSWindowsIdentity] GetCurrent() {
+        return [BoxPSWindowsIdentity]::new()
+    }
+}
+
+class BoxPSWindowsPrincipal {
+    [object] $Identity
+    
+    BoxPSWindowsPrincipal([object] $identity) {
+        $this.Identity = $identity
+    }
+
+    [bool] IsInRole([string] $role) {
+        return $true
+    }
+
+    [bool] IsInRole([System.Security.Principal.WindowsBuiltInRole] $role) {
+        return $true
+    }
+}
+
 $WORK_DIR = "./working_<PID>"
 $global:WORK_DIR = $WORK_DIR
 $CODE_DIR = "<CODE_DIR>"
