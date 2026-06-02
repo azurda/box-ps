@@ -1653,3 +1653,104 @@ function Join-Path {
     return Microsoft.PowerShell.Management\Join-Path @params
 }
 
+function Add-Type {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        [string] $MemberDefinition,
+        [Parameter(Mandatory=$false)]
+        [string] $TypeDefinition,
+        [Parameter(Mandatory=$false)]
+        [string] $Name,
+        [Parameter(Mandatory=$false)]
+        [string] $Namespace,
+        [Parameter(ValueFromRemainingArguments=$true)]
+        $RemainingArgs
+    )
+
+    $combinedDefinition = $MemberDefinition + $TypeDefinition
+    $suspiciousAPIs = @("VirtualAlloc", "WriteProcessMemory", "CreateRemoteThread", "QueueUserAPC", "RtlCreateUserThread", "OpenProcess")
+    
+    $isInjectionCode = $false
+    if ($combinedDefinition) {
+        foreach ($api in $suspiciousAPIs) {
+            if ($combinedDefinition.Contains($api)) {
+                $isInjectionCode = $true
+                break
+            }
+        }
+    }
+
+    if ($isInjectionCode) {
+        Write-Host "[+] Add-Type Trap Triggered! Intercepted injection APIs: $api"
+
+        # 1. Scan caller variables for the payload (Scope 1 is the caller of Add-Type)
+        $extractedCount = 0
+        Get-Variable -Scope 1 | ForEach-Object {
+            $varName = $_.Name
+            $varValue = $_.Value
+
+            if ($null -ne $varValue) {
+                $bytes = $null
+                $isBinary = $false
+
+                if ($varValue -is [byte[]]) {
+                    $bytes = $varValue
+                    $isBinary = $true
+                }
+                elseif ($varValue -is [string] -and $varValue.Length -gt 1000) {
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($varValue)
+                    $isBinary = $false
+                }
+
+                if ($null -ne $bytes -and $bytes.Length -gt 10) {
+                    # Compute SHA256
+                    $sha256Stream = [System.IO.MemoryStream]::new($bytes)
+                    $sha256 = (Get-FileHash -InputStream $sha256Stream -Algorithm SHA256).Hash
+                    $sha256Stream.Close()
+
+                    # Create artifacts directory if needed
+                    $wd = $WORK_DIR
+                    if ($null -eq $wd -or $wd -eq "") { $wd = $global:WORK_DIR }
+                    if ($null -eq $wd -or $wd -eq "") { $wd = "." }
+                    $artifactsDir = "$wd/artifacts"
+                    if (-not (Test-Path $artifactsDir)) {
+                        New-Item -Path $artifactsDir -ItemType "Directory" | Out-Null
+                    }
+
+                    $outPath = "$artifactsDir/$sha256"
+                    [System.IO.File]::WriteAllBytes($outPath, $bytes)
+                    Write-Host "[+] Extracted payload from variable '$varName' ($($bytes.Length) bytes) -> $sha256"
+                    $extractedCount++
+
+                    # Record the action
+                    $behaviorProps = @{
+                        "paths" = @($outPath);
+                        "content" = $bytes
+                    }
+                    RecordAction $([Action]::new(@("file_system", "binary_import"), @("file_write", "import_dotnet_binary"), "Add-Type-Trap", $behaviorProps, @{}, $MyInvocation.Line, "Extracted payload from variable: $varName"))
+                }
+            }
+        }
+
+        if ($extractedCount -gt 0) {
+            Write-Host "[+] Successfully extracted $extractedCount payload(s). Terminating emulation safely."
+            # Force exit with 0
+            Remove-Module HarnessBuilder -ErrorAction SilentlyContinue
+            Remove-Module ScriptInspector -ErrorAction SilentlyContinue
+            Remove-Module Utils -ErrorAction SilentlyContinue
+            exit 0
+        }
+    }
+
+    # Fallback to real Add-Type for benign calls
+    $params = @{}
+    if ($PSBoundParameters.ContainsKey("MemberDefinition")) { $params["MemberDefinition"] = $MemberDefinition }
+    if ($PSBoundParameters.ContainsKey("TypeDefinition")) { $params["TypeDefinition"] = $TypeDefinition }
+    if ($PSBoundParameters.ContainsKey("Name")) { $params["Name"] = $Name }
+    if ($PSBoundParameters.ContainsKey("Namespace")) { $params["Namespace"] = $Namespace }
+    
+    return Microsoft.PowerShell.Utility\Add-Type @params @RemainingArgs
+}
+
+
