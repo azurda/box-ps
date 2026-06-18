@@ -559,6 +559,12 @@ function Add-Type {
 	[Alias("OT")]
 	[OutputAssemblyType] $OutputType,
 	[switch] $PassThru,
+	[Parameter(ParameterSetName="FromPath")]
+	[Parameter(ParameterSetName="FromMember")]
+	[Parameter(ParameterSetName="FromSource")]
+	[Parameter(ParameterSetName="FromLiteralPath")]
+	[Alias("RA")]
+	[string[]] $ReferencedAssemblies,
 	[Parameter(ParameterSetName="FromSource", Mandatory=$true, Position=0)]
 	[string] $TypeDefinition,
 	[Parameter(ParameterSetName="FromMember")]
@@ -672,7 +678,6 @@ function Add-Type {
         }
         return Microsoft.PowerShell.Utility\Add-Type @params
     }
-}
 }
 
 # not for sandboxing. I need this to compensate for a bug in this function which
