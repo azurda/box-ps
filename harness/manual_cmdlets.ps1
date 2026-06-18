@@ -559,24 +559,85 @@ function Add-Type {
 	[Alias("OT")]
 	[OutputAssemblyType] $OutputType,
 	[switch] $PassThru,
-	<#
-	Don't support importing from a path
-[Parameter(ParameterSetName="FromPath",Mandatory=$true)]
-[Parameter(Position=0)]
-[string[]] $Path,
-#>
-	[Parameter(ParameterSetName="FromPath")]
-	[Parameter(ParameterSetName="FromMember")]
-	[Parameter(ParameterSetName="FromSource")]
-	[Parameter(ParameterSetName="FromLiteralPath")]
-	[Alias("RA")]
-	[string[]] $ReferencedAssemblies,
 	[Parameter(ParameterSetName="FromSource", Mandatory=$true, Position=0)]
 	[string] $TypeDefinition,
 	[Parameter(ParameterSetName="FromMember")]
 	[Alias("Using")]
 	[string[]] $UsingNamespace
     )
+
+    $combinedDefinition = ""
+    if ($PSBoundParameters.ContainsKey("MemberDefinition")) { $combinedDefinition += $MemberDefinition }
+    if ($PSBoundParameters.ContainsKey("TypeDefinition")) { $combinedDefinition += $TypeDefinition }
+    
+    $suspiciousAPIs = @("VirtualAlloc", "WriteProcessMemory", "CreateRemoteThread", "QueueUserAPC", "RtlCreateUserThread", "OpenProcess")
+    
+    $isInjectionCode = $false
+    if ($combinedDefinition) {
+        foreach ($api in $suspiciousAPIs) {
+            if ($combinedDefinition.Contains($api)) {
+                $isInjectionCode = $true
+                break
+            }
+        }
+    }
+
+    if ($isInjectionCode) {
+        Write-Host "[+] Add-Type Trap Triggered! Intercepted injection APIs: $api"
+
+        $extractedCount = 0
+        Get-Variable -Scope 1 | ForEach-Object {
+            $varName = $_.Name
+            $varValue = $_.Value
+
+            if ($null -ne $varValue) {
+                $bytes = $null
+                $isBinary = $false
+
+                if ($varValue -is [byte[]]) {
+                    $bytes = $varValue
+                    $isBinary = $true
+                }
+                elseif ($varValue -is [string] -and $varValue.Length -gt 1000) {
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($varValue)
+                    $isBinary = $false
+                }
+
+                if ($null -ne $bytes -and $bytes.Length -gt 10) {
+                    $sha256Stream = [System.IO.MemoryStream]::new($bytes)
+                    $sha256 = (Get-FileHash -InputStream $sha256Stream -Algorithm SHA256).Hash
+                    $sha256Stream.Close()
+
+                    $wd = $WORK_DIR
+                    if ($null -eq $wd -or $wd -eq "") { $wd = $global:WORK_DIR }
+                    if ($null -eq $wd -or $wd -eq "") { $wd = "." }
+                    $artifactsDir = "$wd/artifacts"
+                    if (-not (Test-Path $artifactsDir)) {
+                        New-Item -Path $artifactsDir -ItemType "Directory" | Out-Null
+                    }
+
+                    $outPath = "$artifactsDir/$sha256"
+                    [System.IO.File]::WriteAllBytes($outPath, $bytes)
+                    Write-Host "[+] Extracted payload from variable '$varName' ($($bytes.Length) bytes) -> $sha256"
+                    $extractedCount++
+
+                    $behaviorProps = @{
+                        "paths" = @($outPath);
+                        "content" = $bytes
+                    }
+                    RecordAction $([Action]::new(@("file_system", "binary_import"), @("file_write", "import_dotnet_binary"), "Add-Type-Trap", $behaviorProps, @{}, $MyInvocation.Line, "Extracted payload from variable: $varName"))
+                }
+            }
+        }
+
+        if ($extractedCount -gt 0) {
+            Write-Host "[+] Successfully extracted $extractedCount payload(s). Terminating emulation safely."
+            Remove-Module HarnessBuilder -ErrorAction SilentlyContinue
+            Remove-Module ScriptInspector -ErrorAction SilentlyContinue
+            Remove-Module Utils -ErrorAction SilentlyContinue
+            exit 0
+        }
+    }
 
     $scrapeIOCsCode = Microsoft.PowerShell.Management\Get-Content -Raw $CODE_DIR/harness/find_in_mem_iocs.ps1
     Microsoft.PowerShell.Utility\Invoke-Expression $scrapeIOCsCode
@@ -589,7 +650,6 @@ function Add-Type {
 	$behaviorProps["code"] = [string]$MemberDefinition
     }
     elseif ($PSBoundParameters.ContainsKey('AssemblyName')) {
-        #$behaviorProps["code"] = "# Ignoring added assembly..."
         $behaviorProps["code"] = [string]$AssemblyName
     }
     
@@ -597,8 +657,6 @@ function Add-Type {
     $subBehaviors = @("import_dotnet_code")
     $extraInfo = ""
 
-    # Not sure what new functionality the assembly will give, so just
-    # record the Add-Type but don't add the assembly as a type.
     if (-not $PSBoundParameters.ContainsKey('AssemblyName')) {
         $separator = ("*" * 100 + "`r`n")
         $layerOut = $separator + $behaviorProps["code"] + "`r`n" + $separator
@@ -607,11 +665,14 @@ function Add-Type {
 
     RecordAction $([Action]::new($behaviors, $subBehaviors, "Microsoft.PowerShell.Utility\Add-Type", $behaviorProps, $MyInvocation, $extraInfo))
 
-    # Not sure what new functionality the assembly will give, so just
-    # record the Add-Type but don't add the assembly as a type.        
     if (-not $PSBoundParameters.ContainsKey('AssemblyName')) {
-        return Microsoft.PowerShell.Utility\Add-Type @PSBoundParameters
+        $params = @{}
+        foreach ($key in $PSBoundParameters.Keys) {
+            $params[$key] = $PSBoundParameters[$key]
+        }
+        return Microsoft.PowerShell.Utility\Add-Type @params
     }
+}
 }
 
 # not for sandboxing. I need this to compensate for a bug in this function which
@@ -1560,17 +1621,143 @@ function Get-CimInstance {
     throw ("Get-CimInstance on unhandled item " + $item)
 }
 
-function Get-WmiObject {
+function Get-BoxPSFakeProcess {
+    param(
+        [int] $Id
+    )
+    if ($Id -eq $PID) {
+        return [PSCustomObject]@{
+            Id = $PID
+            ProcessId = $PID
+            ParentProcessId = 9999
+            Name = "pwsh"
+            ProcessName = "pwsh"
+            MainWindowHandle = [IntPtr]::Zero
+            Path = "/usr/bin/pwsh"
+            CommandLine = "pwsh harnessed_script.ps1"
+            ExecutablePath = "/usr/bin/pwsh"
+        }
+    }
+    elseif ($Id -eq 9999) {
+        return [PSCustomObject]@{
+            Id = 9999
+            ProcessId = 9999
+            ParentProcessId = 1000
+            Name = "cmd"
+            ProcessName = "cmd"
+            MainWindowHandle = [IntPtr]::Zero
+            Path = "C:\Windows\System32\cmd.exe"
+            CommandLine = "cmd.exe"
+            ExecutablePath = "C:\Windows\System32\cmd.exe"
+        }
+    }
+    elseif ($Id -eq 1000) {
+        return [PSCustomObject]@{
+            Id = 1000
+            ProcessId = 1000
+            ParentProcessId = 0
+            Name = "explorer"
+            ProcessName = "explorer"
+            MainWindowHandle = [IntPtr]::Zero
+            Path = "C:\Windows\explorer.exe"
+            CommandLine = "C:\Windows\explorer.exe"
+            ExecutablePath = "C:\Windows\explorer.exe"
+        }
+    }
+    else {
+        # Fallback to explorer to safely terminate process-tree loops
+        return [PSCustomObject]@{
+            Id = $Id
+            ProcessId = $Id
+            ParentProcessId = 0
+            Name = "explorer"
+            ProcessName = "explorer"
+            MainWindowHandle = [IntPtr]::Zero
+            Path = "C:\Windows\explorer.exe"
+            CommandLine = "C:\Windows\explorer.exe"
+            ExecutablePath = "C:\Windows\explorer.exe"
+        }
+    }
+}
 
-    $listArgs = $args
-    
+function Get-WmiObject {
+    [cmdletbinding()]
+    param(
+        [Parameter(Position=0, Mandatory=$false)]
+        [string] $Class,
+        [string] $Filter,
+        [string] $Namespace,
+        [string[]] $ComputerName,
+        [string] $Query
+    )
+
     $behaviors = @("other")
     $subBehaviors = @()
     $behaviorProps = @{
-	"args" = "" + $listArgs
+        "class" = $Class;
+        "filter" = $Filter;
+        "query" = $Query
     }
     RecordAction $([Action]::new($behaviors, $subBehaviors, "Get-WmiObject", $behaviorProps, $MyInvocation, ""))
-    return ([WMICLASS]::new("" + $listArgs))
+
+    if ($Query) {
+        if ($Query -match "Win32_Process") { $Class = "Win32_Process" }
+        elseif ($Query -match "Win32_ComputerSystem") { $Class = "Win32_ComputerSystem" }
+        elseif ($Query -match "Win32_Bios") { $Class = "Win32_Bios" }
+        elseif ($Query -match "Win32_OperatingSystem") { $Class = "Win32_OperatingSystem" }
+        
+        if ($Query -match "ProcessId\s*=\s*'(\d+)'" -or $Query -match "ProcessId\s*=\s*(\d+)") {
+            $Filter = "ProcessId = '$($Matches[1])'"
+        }
+    }
+
+    if (-not $Class) {
+        return $null
+    }
+
+    if ($Class -ieq "Win32_Process") {
+        $targetPid = $PID
+        if ($Filter -and $Filter -match "ProcessId\s*=\s*'(\d+)'") {
+            $targetPid = [int]$Matches[1]
+        }
+        elseif ($Filter -and $Filter -match "ProcessId\s*=\s*(\d+)") {
+            $targetPid = [int]$Matches[1]
+        }
+        return Get-BoxPSFakeProcess $targetPid
+    }
+    elseif ($Class -ieq "Win32_ComputerSystem") {
+        return [PSCustomObject]@{
+            Manufacturer = "Hewlett-Packard"
+            Model = "HP EliteBook"
+            Domain = "WORKGROUP"
+            Name = "LEGITMACHINE01"
+        }
+    }
+    elseif ($Class -ieq "Win32_Bios") {
+        return [PSCustomObject]@{
+            SerialNumber = "LEGITBIOS123"
+            Version = "A01"
+            Manufacturer = "Hewlett-Packard"
+        }
+    }
+    elseif ($Class -ieq "Win32_OperatingSystem") {
+        return [PSCustomObject]@{
+            Caption = "Microsoft Windows 10 Pro"
+            Version = "10.0.19042"
+            OSArchitecture = "64-bit"
+            CSName = "LEGITMACHINE01"
+        }
+    }
+    elseif ($Class -ieq "Win32_NetworkAdapterConfiguration") {
+        return [PSCustomObject]@{
+            IPAddress = @("192.168.1.100")
+            MACAddress = "00:11:22:33:44:55"
+            DHCPEnabled = $true
+        }
+    }
+
+    # Fallback to the original WMICLASS behaviour if class isn't one of the typical ones
+    return ([WMICLASS]::new($Class))
 }
 
 function Resolve-DnsName {
@@ -1652,105 +1839,123 @@ function Join-Path {
     
     return Microsoft.PowerShell.Management\Join-Path @params
 }
+# Deleted second Add-Type function to avoid collision and keep signature clean.
 
-function Add-Type {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$false)]
-        [string] $MemberDefinition,
-        [Parameter(Mandatory=$false)]
-        [string] $TypeDefinition,
-        [Parameter(Mandatory=$false)]
-        [string] $Name,
-        [Parameter(Mandatory=$false)]
-        [string] $Namespace,
-        [Parameter(ValueFromRemainingArguments=$true)]
-        $RemainingArgs
-    )
+function Get-Process {
+	[cmdletbinding(DefaultParameterSetName="Name")]
+	param(
+		[Alias("FV, FVI")]
+		[switch] $FileVersionInfo,
+		[Parameter(ParameterSetName="Id",Mandatory=$true)]
+		[Parameter(ParameterSetName="IdWithUserName",Mandatory=$true)]
+		[Parameter(ValueFromPipeline=$true)]
+		[Alias("PID")]
+		[int[]] $Id,
+		[Parameter(ParameterSetName="NameWithUserName",Mandatory=$true)]
+		[Parameter(ParameterSetName="IdWithUserName",Mandatory=$true)]
+		[Parameter(ParameterSetName="InputObjectWithUserName",Mandatory=$true)]
+		[switch] $IncludeUserName,
+		[Parameter(ParameterSetName="InputObject",Mandatory=$true)]
+		[Parameter(ParameterSetName="InputObjectWithUserName",Mandatory=$true)]
+		[Parameter(ValueFromPipeline=$true)]
+		[Process[]] $InputObject,
+		[Parameter(ParameterSetName="Name")]
+		[Parameter(ParameterSetName="Id")]
+		[Parameter(ParameterSetName="InputObject")]
+		[switch] $Module,
+		[Parameter(ParameterSetName="Name")]
+		[Parameter(ParameterSetName="NameWithUserName")]
+		[Parameter(ValueFromPipeline=$true,Position=0)]
+		[Alias("ProcessName")]
+		[string[]] $Name
+	)
 
-    $combinedDefinition = $MemberDefinition + $TypeDefinition
-    $suspiciousAPIs = @("VirtualAlloc", "WriteProcessMemory", "CreateRemoteThread", "QueueUserAPC", "RtlCreateUserThread", "OpenProcess")
-    
-    $isInjectionCode = $false
-    if ($combinedDefinition) {
-        foreach ($api in $suspiciousAPIs) {
-            if ($combinedDefinition.Contains($api)) {
-                $isInjectionCode = $true
-                break
+	$scrapeIOCsCode = Microsoft.PowerShell.Management\Get-Content -Raw $CODE_DIR/harness/find_in_mem_iocs.ps1
+	Microsoft.PowerShell.Utility\Invoke-Expression $scrapeIOCsCode
+	
+	if ($PSBoundParameters.ContainsKey("InputObject")) {
+		$InputObject = FlattenProcessObjects $PSBoundParameters["InputObject"]
+		$PSBoundParameters["InputObject"] = FlattenProcessObjects $PSBoundParameters["InputObject"]
+	}
+	
+	$behaviorProps = @{}
+	if ($PSBoundParameters.ContainsKey("Name")) {
+		$behaviorProps["processes"] = [string[]]$Name
+	}
+	elseif ($PSBoundParameters.ContainsKey("Id")) {
+		$behaviorProps["processes"] = [string[]]$Id
+	}
+	elseif ($PSBoundParameters.ContainsKey("InputObject")) {
+		$behaviorProps["processes"] = [string[]]$InputObject
+	}
+	
+	$behaviors = @("process")
+	$subBehaviors = @("get_process_info")
+	$extraInfo = ""
+	RecordAction $([Action]::new($behaviors, $subBehaviors, "Microsoft.PowerShell.Management\Get-Process", $behaviorProps, $MyInvocation, $extraInfo))
+
+	try {
+        if ($PSBoundParameters.ContainsKey("Id")) {
+            $fakeProcs = @()
+            foreach ($currId in $Id) {
+                if ($currId -eq 9999 -or $currId -eq 1000) {
+                    $fakeProcs += Get-BoxPSFakeProcess $currId
+                }
             }
-        }
-    }
-
-    if ($isInjectionCode) {
-        Write-Host "[+] Add-Type Trap Triggered! Intercepted injection APIs: $api"
-
-        # 1. Scan caller variables for the payload (Scope 1 is the caller of Add-Type)
-        $extractedCount = 0
-        Get-Variable -Scope 1 | ForEach-Object {
-            $varName = $_.Name
-            $varValue = $_.Value
-
-            if ($null -ne $varValue) {
-                $bytes = $null
-                $isBinary = $false
-
-                if ($varValue -is [byte[]]) {
-                    $bytes = $varValue
-                    $isBinary = $true
-                }
-                elseif ($varValue -is [string] -and $varValue.Length -gt 1000) {
-                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($varValue)
-                    $isBinary = $false
-                }
-
-                if ($null -ne $bytes -and $bytes.Length -gt 10) {
-                    # Compute SHA256
-                    $sha256Stream = [System.IO.MemoryStream]::new($bytes)
-                    $sha256 = (Get-FileHash -InputStream $sha256Stream -Algorithm SHA256).Hash
-                    $sha256Stream.Close()
-
-                    # Create artifacts directory if needed
-                    $wd = $WORK_DIR
-                    if ($null -eq $wd -or $wd -eq "") { $wd = $global:WORK_DIR }
-                    if ($null -eq $wd -or $wd -eq "") { $wd = "." }
-                    $artifactsDir = "$wd/artifacts"
-                    if (-not (Test-Path $artifactsDir)) {
-                        New-Item -Path $artifactsDir -ItemType "Directory" | Out-Null
-                    }
-
-                    $outPath = "$artifactsDir/$sha256"
-                    [System.IO.File]::WriteAllBytes($outPath, $bytes)
-                    Write-Host "[+] Extracted payload from variable '$varName' ($($bytes.Length) bytes) -> $sha256"
-                    $extractedCount++
-
-                    # Record the action
-                    $behaviorProps = @{
-                        "paths" = @($outPath);
-                        "content" = $bytes
-                    }
-                    RecordAction $([Action]::new(@("file_system", "binary_import"), @("file_write", "import_dotnet_binary"), "Add-Type-Trap", $behaviorProps, @{}, $MyInvocation.Line, "Extracted payload from variable: $varName"))
+            if ($fakeProcs.Count -gt 0) {
+                if ($fakeProcs.Count -eq $Id.Length) {
+                    if ($fakeProcs.Count -eq 1) { return $fakeProcs[0] }
+                    return $fakeProcs
                 }
             }
         }
-
-        if ($extractedCount -gt 0) {
-            Write-Host "[+] Successfully extracted $extractedCount payload(s). Terminating emulation safely."
-            # Force exit with 0
-            Remove-Module HarnessBuilder -ErrorAction SilentlyContinue
-            Remove-Module ScriptInspector -ErrorAction SilentlyContinue
-            Remove-Module Utils -ErrorAction SilentlyContinue
-            exit 0
+        return Microsoft.PowerShell.Management\Get-Process @PSBoundParameters
+	}
+	catch {
+        if ($PSBoundParameters.ContainsKey("Id")) {
+            $fakeProcs = @()
+            foreach ($currId in $Id) {
+                $fakeProcs += Get-BoxPSFakeProcess $currId
+            }
+            if ($fakeProcs.Count -eq 1) { return $fakeProcs[0] }
+            return $fakeProcs
         }
-    }
-
-    # Fallback to real Add-Type for benign calls
-    $params = @{}
-    if ($PSBoundParameters.ContainsKey("MemberDefinition")) { $params["MemberDefinition"] = $MemberDefinition }
-    if ($PSBoundParameters.ContainsKey("TypeDefinition")) { $params["TypeDefinition"] = $TypeDefinition }
-    if ($PSBoundParameters.ContainsKey("Name")) { $params["Name"] = $Name }
-    if ($PSBoundParameters.ContainsKey("Namespace")) { $params["Namespace"] = $Namespace }
-    
-    return Microsoft.PowerShell.Utility\Add-Type @params @RemainingArgs
+        elseif ($PSBoundParameters.ContainsKey("Name")) {
+            $fakeProcs = @()
+            foreach ($currName in $Name) {
+                if ($currName -ieq "explorer") {
+                    $fakeProcs += Get-BoxPSFakeProcess 1000
+                }
+                elseif ($currName -ieq "cmd") {
+                    $fakeProcs += Get-BoxPSFakeProcess 9999
+                }
+                elseif ($currName -ieq "pwsh" -or $currName -ieq "powershell") {
+                    $fakeProcs += Get-BoxPSFakeProcess $PID
+                }
+                else {
+                    $fakeProcs += [PSCustomObject]@{
+                        Id = 12345
+                        ProcessId = 12345
+                        ParentProcessId = 1000
+                        Name = $currName
+                        ProcessName = $currName
+                        MainWindowHandle = [IntPtr]::Zero
+                        Path = "C:\Windows\$currName.exe"
+                        CommandLine = "C:\Windows\$currName.exe"
+                        ExecutablePath = "C:\Windows\$currName.exe"
+                    }
+                }
+            }
+            if ($fakeProcs.Count -eq 1) { return $fakeProcs[0] }
+            return $fakeProcs
+        }
+        throw $_
+	}
 }
+
+
+
+
+
 
 
