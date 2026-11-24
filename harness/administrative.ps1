@@ -68,6 +68,10 @@ $script:BOXPS_MAX_ACTIONS = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ACTIONS" -D
 $script:BOXPS_MAX_ACTIONS_BYTES = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ACTIONS_BYTES" -Default 20971520
 $script:BOXPS_MAX_REPEAT_BEHAVIOR = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_REPEAT_BEHAVIOR" -Default 10
 $script:BOXPS_MAX_ARTIFACT_ACTIONS = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ARTIFACT_ACTIONS" -Default 100
+$script:BOXPS_MAX_ARTIFACTS_BYTES = Get-BoxPSPositiveIntEnv "BOXPS_MAX_ARTIFACTS_BYTES" 52428800
+$script:BOXPS_MAX_SCRAPED_BYTES = Get-BoxPSPositiveIntEnv "BOXPS_MAX_SCRAPED_BYTES" 5242880
+$script:BOXPS_SEEN_NET_IOCS = [System.Collections.Generic.HashSet[string]]::new()
+$script:BOXPS_SEEN_FS_IOCS = [System.Collections.Generic.HashSet[string]]::new()
 $script:BOXPS_BEHAVIOR_COUNTS = @{}
 $script:BOXPS_ACTION_COUNT = 0
 $script:BOXPS_ARTIFACT_ACTION_COUNT = 0
@@ -129,19 +133,94 @@ class Action <# lawsuit... I'll be here all week #> {
     }
 
     [string] GetBehaviorId() {
+        $hasher = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256
+        )
+        try {
+            if (-not [string]::IsNullOrEmpty($this.Actor)) {
+                $actorBytes = [System.Text.Encoding]::UTF8.GetBytes($this.Actor)
+                $hasher.AppendData($actorBytes)
+            }
 
-        $hashed = $this.Actor
-        foreach ($behaviorProp in $this.BehaviorProps.Keys) {
-            $hashed += $this.BehaviorProps[$behaviorProp] | Out-String
+            if ($null -ne $this.BehaviorProps) {
+                $keys = [string[]]@($this.BehaviorProps.Keys)
+                [System.Array]::Sort($keys)
+                foreach ($behaviorProp in $keys) {
+                    $keyBytes = [System.Text.Encoding]::UTF8.GetBytes($behaviorProp)
+                    $hasher.AppendData($keyBytes)
+                    $this.AppendValueToHash($hasher, $this.BehaviorProps[$behaviorProp])
+                }
+            }
+
+            $hashBytes = $hasher.GetHashAndReset()
+            return [System.BitConverter]::ToString($hashBytes).Replace("-", "")
         }
+        finally {
+            $hasher.Dispose()
+        }
+    }
 
-        $stringStream = [System.IO.MemoryStream]::new()
-        $streamWriter = [System.IO.StreamWriter]::new($stringStream)
-        $streamWriter.write($hashed)
-        $streamWriter.Flush()
-        $stringStream.Position = 0
+    hidden [void] AppendStringToHash([System.Security.Cryptography.IncrementalHash] $Hasher, [string] $Text) {
+        if ([string]::IsNullOrEmpty($Text)) {
+            return
+        }
+        # Chunk large strings so multi-megabyte payloads never trigger large temporary allocations.
+        $chunkChars = 65536
+        if ($Text.Length -le $chunkChars) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+            $Hasher.AppendData($bytes)
+            return
+        }
+        $offset = 0
+        while ($offset -lt $Text.Length) {
+            $len = [Math]::Min($chunkChars, $Text.Length - $offset)
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text.Substring($offset, $len))
+            $Hasher.AppendData($bytes)
+            $offset += $len
+        }
+    }
 
-        return (Get-FileHash -InputStream $stringStream -Algorithm SHA256).Hash
+    hidden [void] AppendValueToHash([System.Security.Cryptography.IncrementalHash] $Hasher, [object] $Val) {
+        if ($null -eq $Val) {
+            return
+        }
+        if ($Val -is [byte[]]) {
+            if ($Val.Length -gt 0) {
+                $Hasher.AppendData($Val)
+            }
+            return
+        }
+        if ($Val -is [int[]]) {
+            if ($Val.Length -eq 0) {
+                return
+            }
+            $buf = [byte[]]::new(65536)
+            [long] $totalBytes = [long]$Val.Length * 4
+            [long] $offset = 0
+            while ($offset -lt $totalBytes) {
+                [int] $chunk = [Math]::Min($buf.Length, $totalBytes - $offset)
+                [System.Buffer]::BlockCopy($Val, [int]$offset, $buf, 0, $chunk)
+                $Hasher.AppendData($buf, 0, $chunk)
+                $offset += $chunk
+            }
+            return
+        }
+        if ($Val -is [string]) {
+            $this.AppendStringToHash($Hasher, $Val)
+            return
+        }
+        if ($Val -is [System.Array]) {
+            $this.AppendStringToHash($Hasher, "[len=$($Val.Length)]")
+            $limit = [Math]::Min($Val.Length, 4096)
+            for ($i = 0; $i -lt $limit; $i++) {
+                $elem = $Val[$i]
+                if ($null -ne $elem) {
+                    $this.AppendStringToHash($Hasher, [string]$elem)
+                }
+            }
+            return
+        }
+        $this.AppendStringToHash($Hasher, [string]$Val)
     }
 
     # linear walk through all parameters rebuilding bound params and switches
@@ -205,20 +284,311 @@ function Test-IsArtifactAction {
     return $false
 }
 
+function Convert-ToRawBytes {
+    param(
+        [object] $Val
+    )
+
+    if ($null -eq $Val) {
+        return $null
+    }
+    if ($Val -is [byte[]]) {
+        return ,$Val
+    }
+    if ($Val -is [int[]]) {
+        try {
+            return ,([byte[]]$Val)
+        }
+        catch {
+            return $null
+        }
+    }
+    if ($Val -is [object[]]) {
+        $len = $Val.Length
+        $out = [byte[]]::new($len)
+        for ($i = 0; $i -lt $len; $i++) {
+            $elem = $Val[$i]
+            if ($elem -is [byte] -or $elem -is [sbyte] -or $elem -is [int16] -or $elem -is [uint16] -or
+                $elem -is [int32] -or $elem -is [uint32] -or $elem -is [int64] -or $elem -is [uint64] -or
+                $elem -is [decimal] -or $elem -is [double] -or $elem -is [single]) {
+                [long] $num = [long]$elem
+                if ($num -lt 0 -or $num -gt 255) {
+                    return $null
+                }
+                $out[$i] = [byte]$num
+            }
+            else {
+                return $null
+            }
+        }
+        return ,$out
+    }
+    if ($Val -is [string]) {
+        return ,([System.Text.Encoding]::UTF8.GetBytes($Val))
+    }
+    return $null
+}
+
+function Get-ArtifactsDirectoryBytes {
+    param(
+        [string] $ArtifactsDir
+    )
+
+    if (-not [System.IO.Directory]::Exists($ArtifactsDir)) {
+        return [long]0
+    }
+    [long] $total = 0
+    foreach ($filePath in [System.IO.Directory]::GetFiles($ArtifactsDir)) {
+        $total += ([System.IO.FileInfo]::new($filePath)).Length
+    }
+    return $total
+}
+
+function Compact-ActionPropertyTable {
+    param(
+        [hashtable] $Table
+    )
+
+    if ($null -eq $Table) {
+        return
+    }
+
+    $maxArrayLen = 4096
+    $maxStringLen = 16384
+
+    foreach ($key in @($Table.Keys)) {
+        $val = $Table[$key]
+        if ($null -eq $val) {
+            continue
+        }
+        if ($val -is [System.Array]) {
+            if ($val.Length -gt $maxArrayLen) {
+                $Table[$key] = "<truncated: $($val.Length) items>"
+                continue
+            }
+            $hasOversizedElem = $false
+            for ($i = 0; $i -lt $val.Length; $i++) {
+                if ($val[$i] -is [string] -and $val[$i].Length -gt $maxStringLen) {
+                    $hasOversizedElem = $true
+                    break
+                }
+            }
+            if ($hasOversizedElem) {
+                $cloned = [object[]]::new($val.Length)
+                for ($i = 0; $i -lt $val.Length; $i++) {
+                    $elem = $val[$i]
+                    if ($elem -is [string] -and $elem.Length -gt $maxStringLen) {
+                        $cloned[$i] = $elem.Substring(0, $maxStringLen) + "... <truncated: $($elem.Length) chars>"
+                    }
+                    else {
+                        $cloned[$i] = $elem
+                    }
+                }
+                $Table[$key] = $cloned
+            }
+        }
+        elseif ($val -is [string] -and $val.Length -gt $maxStringLen) {
+            $Table[$key] = $val.Substring(0, $maxStringLen) + "... <truncated: $($val.Length) chars>"
+        }
+    }
+}
+
+function Harvest-ActionArtifactsAtRecordTime {
+    param(
+        [Action] $Action,
+        [string] $WorkDir
+    )
+
+    if ($null -eq $Action) {
+        return
+    }
+
+    if ($null -ne $Action.BehaviorProps) {
+        $Action.BehaviorProps = $Action.BehaviorProps.Clone()
+    }
+    if ($null -ne $Action.Parameters) {
+        $Action.Parameters = $Action.Parameters.Clone()
+    }
+
+    $behaviorPropMap = @{
+        "write_to_memory" = "bytes"
+        "file_write"      = "content"
+        "binary_import"   = "bytes"
+    }
+
+    $allBehaviors = @()
+    if ($null -ne $Action.Behaviors) { $allBehaviors += $Action.Behaviors }
+    if ($null -ne $Action.SubBehaviors) { $allBehaviors += $Action.SubBehaviors }
+
+    $processedProps = [System.Collections.Generic.HashSet[string]]::new()
+    if ($null -ne $Action.BehaviorProps) {
+        foreach ($behavior in $allBehaviors) {
+            if ($null -eq $behavior -or -not $behaviorPropMap.ContainsKey($behavior)) {
+                continue
+            }
+            $prop = $behaviorPropMap[$behavior]
+            if ($processedProps.Contains($prop) -or -not $Action.BehaviorProps.ContainsKey($prop)) {
+                continue
+            }
+
+            $rawVal = $Action.BehaviorProps[$prop]
+            if ($rawVal -is [System.Array] -and $rawVal.Length -eq 1 -and $rawVal[0] -is [string]) {
+                $rawVal = $rawVal[0]
+            }
+            if ($null -eq $rawVal) {
+                continue
+            }
+            if ($rawVal -is [string] -and ($rawVal.StartsWith("<harvested artifact:") -or $rawVal.StartsWith("<truncated:"))) {
+                continue
+            }
+
+            $isBinaryArray = ($rawVal -is [System.Array])
+            $rawLen = if ($isBinaryArray) { $rawVal.Length } elseif ($rawVal -is [string]) { $rawVal.Length } else { 0 }
+            if ($rawLen -le 10) {
+                continue
+            }
+
+            [byte[]] $rawBytes = Convert-ToRawBytes -Val $rawVal
+            if ($null -eq $rawBytes -or $rawBytes.Length -le 10) {
+                continue
+            }
+
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $sha256 = ""
+            try {
+                $hashBytes = $sha.ComputeHash($rawBytes)
+                $sha256 = [System.BitConverter]::ToString($hashBytes).Replace("-", "")
+            }
+            finally {
+                $sha.Dispose()
+            }
+
+            $artifactsDir = [System.IO.Path]::Combine($WorkDir, "artifacts")
+            if (-not [System.IO.Directory]::Exists($artifactsDir)) {
+                [void][System.IO.Directory]::CreateDirectory($artifactsDir)
+            }
+            $artifactPath = [System.IO.Path]::Combine($artifactsDir, $sha256)
+            if (-not [System.IO.File]::Exists($artifactPath)) {
+                $existingBytes = Get-ArtifactsDirectoryBytes -ArtifactsDir $artifactsDir
+                if (($existingBytes + $rawBytes.Length) -le $script:BOXPS_MAX_ARTIFACTS_BYTES) {
+                    [System.IO.File]::WriteAllBytes($artifactPath, $rawBytes)
+                }
+            }
+
+            if ([System.IO.File]::Exists($artifactPath)) {
+                $fileType = if ($isBinaryArray -and $rawBytes.Length -ge 2 -and $rawBytes[0] -eq 77 -and $rawBytes[1] -eq 90) {
+                    "PE"
+                }
+                else {
+                    "unknown"
+                }
+                $ndjsonLine = "{`"actionId`":`"$($Action.Id)`",`"sha256`":`"$sha256`",`"fileType`":`"$fileType`"}`n"
+                [System.IO.File]::AppendAllText(
+                    [System.IO.Path]::Combine($WorkDir, "harvested_artifacts.jsonl"),
+                    $ndjsonLine,
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
+
+            [void]$processedProps.Add($prop)
+
+            if (($isBinaryArray -and $rawBytes.Length -gt 4096) -or ($rawVal -is [string] -and $rawVal.Length -gt 16384)) {
+                $placeholder = "<harvested artifact: sha256=$sha256, bytes=$($rawBytes.Length)>"
+                $Action.BehaviorProps[$prop] = $placeholder
+                if ($null -ne $Action.Parameters) {
+                    foreach ($paramKey in @($Action.Parameters.Keys)) {
+                        $paramVal = $Action.Parameters[$paramKey]
+                        if ($paramVal -is [System.Array] -and $paramVal.Length -gt 4096) {
+                            if ($paramVal.Length -eq $rawBytes.Length) {
+                                $Action.Parameters[$paramKey] = $placeholder
+                            }
+                            else {
+                                $Action.Parameters[$paramKey] = "<truncated: $($paramVal.Length) items>"
+                            }
+                        }
+                        elseif ($paramVal -is [string] -and $paramVal.Length -gt 16384) {
+                            if ($rawVal -is [string] -and $paramVal.Length -eq $rawVal.Length) {
+                                $Action.Parameters[$paramKey] = $placeholder
+                            }
+                            else {
+                                $Action.Parameters[$paramKey] = $paramVal.Substring(0, 16384) + "... <truncated: $($paramVal.Length) chars>"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Compact-ActionPropertyTable -Table $Action.BehaviorProps
+    Compact-ActionPropertyTable -Table $Action.Parameters
+}
+
+function Append-BoundedIocLine {
+    param(
+        [string] $FilePath,
+        [string] $Value,
+        [long] $MaxBytes
+    )
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return
+    }
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $lineText = $Value + "`n"
+    $lineBytes = $utf8NoBom.GetBytes($lineText)
+    [long] $currentLen = 0
+    if ([System.IO.File]::Exists($FilePath)) {
+        $currentLen = ([System.IO.FileInfo]::new($FilePath)).Length
+    }
+    if (($currentLen + $lineBytes.Length) -gt $MaxBytes) {
+        return
+    }
+    [System.IO.File]::AppendAllText($FilePath, $lineText, $utf8NoBom)
+}
+
+function Save-DroppedActionIOCs {
+    param(
+        [Action] $Action,
+        [string] $WorkDir
+    )
+
+    if ($null -eq $Action -or [string]::IsNullOrEmpty($WorkDir)) {
+        return
+    }
+
+    if ($null -ne $Action.Behaviors -and $Action.Behaviors -contains "network" -and $null -ne $Action.BehaviorProps -and $Action.BehaviorProps.ContainsKey("uri")) {
+        foreach ($rawUri in @($Action.BehaviorProps["uri"])) {
+            if ($null -eq $rawUri) {
+                continue
+            }
+            $u = [string]$rawUri
+            if (-not [string]::IsNullOrEmpty($u) -and $script:BOXPS_SEEN_NET_IOCS.Add($u)) {
+                $netPath = [System.IO.Path]::Combine($WorkDir, "scraped_network.txt")
+                Append-BoundedIocLine -FilePath $netPath -Value $u -MaxBytes $script:BOXPS_MAX_SCRAPED_BYTES
+            }
+        }
+    }
+
+    if ($null -ne $Action.Behaviors -and $Action.Behaviors -contains "file_system" -and $null -ne $Action.BehaviorProps -and $Action.BehaviorProps.ContainsKey("paths")) {
+        foreach ($rawPath in @($Action.BehaviorProps["paths"])) {
+            if ($null -eq $rawPath) {
+                continue
+            }
+            $p = [string]$rawPath
+            if (-not [string]::IsNullOrEmpty($p) -and $script:BOXPS_SEEN_FS_IOCS.Add($p)) {
+                $fsPath = [System.IO.Path]::Combine($WorkDir, "scraped_paths.txt")
+                Append-BoundedIocLine -FilePath $fsPath -Value $p -MaxBytes $script:BOXPS_MAX_SCRAPED_BYTES
+            }
+        }
+    }
+}
+
 function RecordAction {
 
     param(
         [Action] $Action
     )
-
-    $bid = if ($null -ne $Action.BehaviorId) { $Action.BehaviorId } else { "" }
-    $prevCount = 0
-    if ($script:BOXPS_BEHAVIOR_COUNTS.ContainsKey($bid)) {
-        $prevCount = [int]$script:BOXPS_BEHAVIOR_COUNTS[$bid]
-    }
-    if ($prevCount -ge $script:BOXPS_MAX_REPEAT_BEHAVIOR) {
-        return
-    }
 
     $wd = $WORK_DIR
     if ($null -eq $wd -or $wd -eq "") { $wd = $global:WORK_DIR }
@@ -226,6 +596,16 @@ function RecordAction {
 
     $resolvedWd = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($wd)
     $actionsPath = [System.IO.Path]::Combine($resolvedWd, "actions.json")
+
+    $bid = if ($null -ne $Action.BehaviorId) { $Action.BehaviorId } else { "" }
+    $prevCount = 0
+    if ($script:BOXPS_BEHAVIOR_COUNTS.ContainsKey($bid)) {
+        $prevCount = [int]$script:BOXPS_BEHAVIOR_COUNTS[$bid]
+    }
+    if ($prevCount -ge $script:BOXPS_MAX_REPEAT_BEHAVIOR) {
+        Save-DroppedActionIOCs $Action $resolvedWd
+        return
+    }
 
     [long] $actionsSize = 0
     if ([System.IO.File]::Exists($actionsPath)) {
@@ -249,6 +629,7 @@ function RecordAction {
                     [System.Text.UTF8Encoding]::new($false)
                 )
             }
+            Save-DroppedActionIOCs $Action $resolvedWd
             return
         }
     }
@@ -259,6 +640,8 @@ function RecordAction {
     # read and update the running action id on disk
     $Action.Id = [int](Microsoft.PowerShell.Management\Get-Content -Raw "$wd/action_id.txt")
     ($Action.Id + 1) | Out-File "$wd/action_id.txt"
+
+    Harvest-ActionArtifactsAtRecordTime -Action $Action -WorkDir $resolvedWd
 
     $json = $Action | ConvertTo-Json -Depth 5 -Compress
     # manual_cmdlets.ps1's ConvertTo-Json startInfo branch omits -Compress; normalize to single-line NDJSON

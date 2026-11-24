@@ -232,6 +232,11 @@ function HandleCmdInvocation {
 
     # TODO import administrative or something so we don't have duplicate code here it bites me every time
     # TODO parse out flags used to put them in arguments
+    $recordedScript = $invokedScript
+    if ($null -ne $recordedScript -and $recordedScript.Length -gt 16384) {
+        $recordedScript = $recordedScript.Substring(0, 16384) + "... <truncated: $($invokedScript.Length) chars>"
+    }
+
     [hashtable] $action = @{
         "Behaviors" = @("script_exec")
         "SubBehaviors" = @("start_process")
@@ -239,7 +244,7 @@ function HandleCmdInvocation {
         "Line" = ""
         "ExtraInfo" = ""
         "BehaviorProps" = @{
-            "script" = $invokedScript
+            "script" = $recordedScript
         }
         "Parameters" = @{}
         "Id" = 0
@@ -257,7 +262,17 @@ function HandleCmdInvocation {
 
     $json = $action | ConvertTo-Json -Depth 10 -Compress
     $resolvedActionsPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("$WORK_DIR/actions.json")
-    [System.IO.File]::AppendAllText($resolvedActionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
+    $maxActionsBytes = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ACTIONS_BYTES" -Default 20971520
+    $lineText = $json + "`n"
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $lineByteCount = $utf8NoBom.GetByteCount($lineText)
+    [long] $currentActionsBytes = 0
+    if ([System.IO.File]::Exists($resolvedActionsPath)) {
+        $currentActionsBytes = ([System.IO.FileInfo]::new($resolvedActionsPath)).Length
+    }
+    if (($currentActionsBytes + $lineByteCount) -le $maxActionsBytes) {
+        [System.IO.File]::AppendAllText($resolvedActionsPath, $lineText, $utf8NoBom)
+    }
 
     return $invokedScript
 }
@@ -312,12 +327,73 @@ function HandleDirectlyWrittenFiles {
     }
 }
 
+function Add-ArtifactMapEntry {
+    param(
+        [hashtable] $ArtifactMap,
+        [string] $ActionId,
+        [string] $Sha256,
+        [string] $FileType
+    )
+
+    if ([string]::IsNullOrEmpty($ActionId) -or [string]::IsNullOrEmpty($Sha256)) {
+        return
+    }
+    if (-not $ArtifactMap.Contains($ActionId)) {
+        $ArtifactMap[$ActionId] = @()
+    }
+    foreach ($existing in $ArtifactMap[$ActionId]) {
+        if ($existing["sha256"] -eq $Sha256) {
+            return
+        }
+    }
+    $ArtifactMap[$ActionId] += @{
+        "sha256" = $Sha256
+        "fileType" = $FileType
+    }
+}
+
+function Get-ArtifactsDirBytes {
+    param(
+        [string] $ArtifactsDir
+    )
+
+    if (-not [System.IO.Directory]::Exists($ArtifactsDir)) {
+        return [long]0
+    }
+    [long] $total = 0
+    foreach ($filePath in [System.IO.Directory]::GetFiles($ArtifactsDir)) {
+        $total += ([System.IO.FileInfo]::new($filePath)).Length
+    }
+    return $total
+}
+
+function Convert-JsonArtifactToBytes {
+    param(
+        [object] $Content,
+        [bool] $IsArray
+    )
+
+    if (-not $IsArray) {
+        return ,([System.Text.Encoding]::UTF8.GetBytes([string]$Content))
+    }
+    if ($Content -is [byte[]]) {
+        return ,$Content
+    }
+    $len = $Content.Length
+    $bytes = [byte[]]::new($len)
+    for ($i = 0; $i -lt $len; $i++) {
+        $bytes[$i] = [byte]$Content[$i]
+    }
+    return ,$bytes
+}
+
 # extracts artifacts from a single action, writes them to disk, and updates $ArtifactMap
 function HarvestSingleActionArtifacts {
     param(
         [object] $Action,
         [string] $ArtifactsDir,
-        [hashtable] $ArtifactMap
+        [hashtable] $ArtifactMap,
+        [long] $MaxArtifactsBytes = 52428800
     )
 
     $behaviorMap = @{
@@ -353,22 +429,37 @@ function HarvestSingleActionArtifacts {
             $artifactContent = $artifactContent[0]
         }
 
+        if ($artifactContent -is [string] -and ($artifactContent.StartsWith("<harvested artifact:") -or $artifactContent.StartsWith("<truncated:"))) {
+            continue
+        }
+
         if ($artifactContent.Length -le 10) {
             continue
         }
 
-        $actionId = ($Action.Id | Out-String).Trim()
+        $actionId = [string]$Action.Id
         $fileType = "unknown"
-        $outPath = [System.IO.Path]::Combine($ArtifactsDir, "tmp.bin")
+        [byte[]] $rawBytes = $null
+        $sha256 = ""
 
         try {
-            # array content means bytes, assuming we'll never have an array of chars
-            if ($artifactIsArray) {
-                [System.IO.File]::WriteAllBytes($outPath, $artifactContent)
+            $rawBytes = Convert-JsonArtifactToBytes -Content $artifactContent -IsArray $artifactIsArray
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $hashBytes = $sha.ComputeHash($rawBytes)
+                $sha256 = [System.BitConverter]::ToString($hashBytes).Replace("-", "")
             }
-            # content is just text
-            else {
-                $artifactContent | Out-File $outPath
+            finally {
+                $sha.Dispose()
+            }
+
+            $destPath = [System.IO.Path]::Combine($ArtifactsDir, $sha256)
+            if (-not [System.IO.File]::Exists($destPath)) {
+                $existingBytes = Get-ArtifactsDirBytes -ArtifactsDir $ArtifactsDir
+                if (($existingBytes + $rawBytes.Length) -gt $MaxArtifactsBytes) {
+                    continue
+                }
+                [System.IO.File]::WriteAllBytes($destPath, $rawBytes)
             }
         }
         catch {
@@ -376,22 +467,12 @@ function HarvestSingleActionArtifacts {
             continue
         }
 
-        $sha256 = (Get-FileHash -Path $outPath -Algorithm SHA256).Hash
-        Move-Item -Path $outPath -Destination ([System.IO.Path]::Combine($ArtifactsDir, $sha256)) -Force
-
         # check if the bytes indicate a PE file
-        if ($artifactIsArray -and $artifactContent[0] -eq 77 -and $artifactContent[1] -eq 90) {
+        if ($artifactIsArray -and $rawBytes.Length -ge 2 -and $rawBytes[0] -eq 77 -and $rawBytes[1] -eq 90) {
             $fileType = "PE"
         }
 
-        if (-not $ArtifactMap.Contains($actionId)) {
-            $ArtifactMap[$actionId] = @()
-        }
-
-        $ArtifactMap[$actionId] += @{
-            "sha256" = $sha256;
-            "fileType" = $fileType
-        }
+        Add-ArtifactMapEntry -ArtifactMap $ArtifactMap -ActionId $actionId -Sha256 $sha256 -FileType $fileType
     }
 }
 
@@ -531,6 +612,104 @@ function Get-CompactedActionJson {
     return $RawJsonLine
 }
 
+function Test-ContainsBytePattern {
+    param(
+        [byte[]] $Haystack,
+        [int] $HaystackLen,
+        [byte[]] $Needle
+    )
+
+    $nLen = $Needle.Length
+    if ($HaystackLen -lt $nLen -or $nLen -eq 0) {
+        return $false
+    }
+    $firstByte = $Needle[0]
+    $limit = $HaystackLen - $nLen
+    $idx = 0
+    while ($idx -le $limit) {
+        $found = [System.Array]::IndexOf($Haystack, $firstByte, $idx, $limit - $idx + 1)
+        if ($found -lt 0) {
+            return $false
+        }
+        $match = $true
+        for ($j = 1; $j -lt $nLen; $j++) {
+            if ($Haystack[$found + $j] -ne $Needle[$j]) {
+                $match = $false
+                break
+            }
+        }
+        if ($match) {
+            return $true
+        }
+        $idx = $found + 1
+    }
+    return $false
+}
+
+function Write-BoundedStreamChunk {
+    param(
+        [System.IO.FileStream] $DestStream,
+        [byte[]] $Buffer,
+        [int] $Count,
+        [long] $MaxBytes,
+        [ref] $WrittenBytes,
+        [ref] $TruncatedFlag
+    )
+
+    if ($Count -le 0) {
+        return
+    }
+    [long] $written = $WrittenBytes.Value
+    if ($written -lt $MaxBytes) {
+        [int] $toWrite = [int][Math]::Min([long]$Count, $MaxBytes - $written)
+        $DestStream.Write($Buffer, 0, $toWrite)
+        $WrittenBytes.Value = $written + $toWrite
+        if ($toWrite -lt $Count -and -not $TruncatedFlag.Value) {
+            $TruncatedFlag.Value = $true
+            $notice = [System.Text.Encoding]::UTF8.GetBytes("`n[!] output truncated at $MaxBytes bytes`n")
+            $DestStream.Write($notice, 0, $notice.Length)
+        }
+    }
+    elseif (-not $TruncatedFlag.Value) {
+        $TruncatedFlag.Value = $true
+        $notice = [System.Text.Encoding]::UTF8.GetBytes("`n[!] output truncated at $MaxBytes bytes`n")
+        $DestStream.Write($notice, 0, $notice.Length)
+    }
+}
+
+function Import-HarvestedArtifactsManifest {
+    param(
+        [string] $ManifestPath,
+        [hashtable] $ArtifactMap
+    )
+
+    if (-not [System.IO.File]::Exists($ManifestPath)) {
+        return
+    }
+    $reader = [System.IO.StreamReader]::new($ManifestPath, [System.Text.Encoding]::UTF8)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $trimmed = $line.Trim()
+            if ([string]::IsNullOrEmpty($trimmed)) {
+                continue
+            }
+            try {
+                $entry = $trimmed | ConvertFrom-Json
+                if ($null -ne $entry) {
+                    $fileType = if ([string]::IsNullOrEmpty([string]$entry.fileType)) { "unknown" } else { [string]$entry.fileType }
+                    Add-ArtifactMapEntry -ArtifactMap $ArtifactMap -ActionId ([string]$entry.actionId) -Sha256 ([string]$entry.sha256) -FileType $fileType
+                }
+            }
+            catch {
+                [Console]::Error.WriteLine("[!] box-ps skipping malformed harvested artifact entry: $($_.Exception.Message)")
+            }
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
+
 function Write-StreamingReport {
     param(
         [string] $WorkDir,
@@ -548,6 +727,10 @@ function Write-StreamingReport {
     HandleDirectlyWrittenFiles
 
     $artifactMap = @{}
+    $maxArtifactsBytes = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ARTIFACTS_BYTES" -Default 52428800
+    $harvestedManifestPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("$WorkDir/harvested_artifacts.jsonl")
+    Import-HarvestedArtifactsManifest -ManifestPath $harvestedManifestPath -ArtifactMap $artifactMap
+
     $pathsSet = [System.Collections.Generic.HashSet[string]]::new()
     $networkSet = [System.Collections.Generic.HashSet[string]]::new()
     $envReport = @{}
@@ -592,7 +775,7 @@ function Write-StreamingReport {
                     }
 
                     # Harvest artifacts before compacting oversized properties in memory
-                    HarvestSingleActionArtifacts -Action $action -ArtifactsDir $resolvedArtifactsDir -ArtifactMap $artifactMap
+                    HarvestSingleActionArtifacts -Action $action -ArtifactsDir $resolvedArtifactsDir -ArtifactMap $artifactMap -MaxArtifactsBytes $maxArtifactsBytes
                     Update-ActionIndicatorsAndProbes -Action $action -PathsSet $pathsSet -NetworkSet $networkSet -EnvReport $envReport
 
                     $emitAction = $false
@@ -916,11 +1099,13 @@ else {
         [void]$psi.ArgumentList.Add($resolvedHarnessedPath)
     }
 
+    $maxStdioBytes = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_STDIO_BYTES" -Default 2097152
     $proc = $null
     $stdoutFs = $null
     $stderrFs = $null
     $innerExitCode = -1
     $startError = $null
+    $sawSystemOom = $false
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
         if ($null -eq $proc) {
@@ -929,12 +1114,76 @@ else {
         $stdoutFs = [System.IO.FileStream]::new($resolvedStdoutPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
         $stderrFs = [System.IO.FileStream]::new($resolvedStderrPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
 
-        $stdoutTask = $proc.StandardOutput.BaseStream.CopyToAsync($stdoutFs)
-        $stderrTask = $proc.StandardError.BaseStream.CopyToAsync($stderrFs)
+        $bufSize = 65536
+        $stdoutBuf = [byte[]]::new($bufSize)
+        $stderrBuf = [byte[]]::new($bufSize)
+        $stdoutBase = $proc.StandardOutput.BaseStream
+        $stderrBase = $proc.StandardError.BaseStream
+
+        [long] $stdoutWritten = 0
+        [long] $stderrWritten = 0
+        $stdoutTruncated = $false
+        $stderrTruncated = $false
+        $oomPattern = [System.Text.Encoding]::UTF8.GetBytes("System.OutOfMemoryException")
+        $errTail = [byte[]]::new(0)
+
+        $stdoutTask = $stdoutBase.ReadAsync($stdoutBuf, 0, $bufSize)
+        $stderrTask = $stderrBase.ReadAsync($stderrBuf, 0, $bufSize)
+        $stdoutDone = $false
+        $stderrDone = $false
+
+        while (-not $stdoutDone -or -not $stderrDone) {
+            $waitTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new(2)
+            if (-not $stdoutDone) { [void]$waitTasks.Add($stdoutTask) }
+            if (-not $stderrDone) { [void]$waitTasks.Add($stderrTask) }
+            [void][System.Threading.Tasks.Task]::WaitAny($waitTasks.ToArray())
+
+            if (-not $stdoutDone -and $stdoutTask.IsCompleted) {
+                $outRead = $stdoutTask.GetAwaiter().GetResult()
+                if ($outRead -le 0) {
+                    $stdoutDone = $true
+                    $stdoutTask = $null
+                }
+                else {
+                    Write-BoundedStreamChunk -DestStream $stdoutFs -Buffer $stdoutBuf -Count $outRead `
+                        -MaxBytes $maxStdioBytes -WrittenBytes ([ref]$stdoutWritten) -TruncatedFlag ([ref]$stdoutTruncated)
+                    $stdoutTask = $stdoutBase.ReadAsync($stdoutBuf, 0, $bufSize)
+                }
+            }
+
+            if (-not $stderrDone -and $stderrTask.IsCompleted) {
+                $errRead = $stderrTask.GetAwaiter().GetResult()
+                if ($errRead -le 0) {
+                    $stderrDone = $true
+                    $stderrTask = $null
+                }
+                else {
+                    if (-not $sawSystemOom) {
+                        $combinedLen = $errTail.Length + $errRead
+                        $combined = [byte[]]::new($combinedLen)
+                        if ($errTail.Length -gt 0) {
+                            [System.Buffer]::BlockCopy($errTail, 0, $combined, 0, $errTail.Length)
+                        }
+                        [System.Buffer]::BlockCopy($stderrBuf, 0, $combined, $errTail.Length, $errRead)
+                        if (Test-ContainsBytePattern -Haystack $combined -HaystackLen $combinedLen -Needle $oomPattern) {
+                            $sawSystemOom = $true
+                            $errTail = [byte[]]::new(0)
+                        }
+                        else {
+                            $tailLen = [Math]::Min(32, $combinedLen)
+                            $errTail = [byte[]]::new($tailLen)
+                            [System.Buffer]::BlockCopy($combined, $combinedLen - $tailLen, $errTail, 0, $tailLen)
+                        }
+                    }
+
+                    Write-BoundedStreamChunk -DestStream $stderrFs -Buffer $stderrBuf -Count $errRead `
+                        -MaxBytes $maxStdioBytes -WrittenBytes ([ref]$stderrWritten) -TruncatedFlag ([ref]$stderrTruncated)
+                    $stderrTask = $stderrBase.ReadAsync($stderrBuf, 0, $bufSize)
+                }
+            }
+        }
 
         $proc.WaitForExit()
-        [void]$stdoutTask.GetAwaiter().GetResult()
-        [void]$stderrTask.GetAwaiter().GetResult()
         $innerExitCode = $proc.ExitCode
     }
     catch {
@@ -970,7 +1219,7 @@ else {
         $errorReason = "sandbox timeout wrapper failed (exit code $innerExitCode)"
         $errorCode = $innerExitCode
     }
-    elseif ($null -ne $stderr -and $stderr.Contains("OutOfMemoryException")) {
+    elseif ($innerExitCode -ne 0 -and ($sawSystemOom -or ($null -ne $stderr -and $stderr.Contains("System.OutOfMemoryException")))) {
         $fail = $true
         $errorReason = "sandboxed process ran out of memory"
         $errorCode = 137
