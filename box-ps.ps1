@@ -68,138 +68,94 @@ if (!$ReportOnly -and !$OutDir) {
 
 $utils = Import-Module -Name $PSScriptRoot/Utils.psm1 -AsCustomObject -Scope Local
 
-class Report {
+function Get-BoxPSPositiveIntEnv {
+    param(
+        [string] $Name,
+        [long] $Default
+    )
 
-    [object[]] $Actions
-    [object] $PotentialIndicators
-    [object] $EnvironmentProbes
-    [hashtable] $Artifacts
-    [string[]] $PotentialArtifacts
-    [string] $WorkingDir
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    [long] $parsed = 0
+    if (-not [string]::IsNullOrWhiteSpace($raw) -and [long]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) {
+        return $parsed
+    }
+    return $Default
+}
 
-    Report([object[]] $actions, [string[]] $scrapedNetwork, [string[]] $scrapedPaths, 
-           [string[]] $scrapedEnvProbes, [hashtable] $artifactMap, [string[]] $potentialArtifacts,
-           [string] $workingDir) {
+function ReadBoundedText {
+    param(
+        [string] $Path,
+        [int] $MaxChars = 262144
+    )
 
-        if ($null -eq $actions) {
-            $this.Actions = @()
-        }
-        else {
-            $this.Actions = $actions
-        }
-
-        $this.PotentialIndicators = $this.CombineScrapedIOCs($scrapedNetwork, $scrapedPaths)
-        $this.EnvironmentProbes = $this.GenerateEnvProbeReport($scrapedEnvProbes)
-        $this.Artifacts = $artifactMap
-        $this.PotentialArtifacts = $potentialArtifacts
-        $this.WorkingDir = $workingDir           
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if (-not [System.IO.File]::Exists($resolvedPath)) {
+        return ""
     }
 
-    [hashtable] GenerateEnvProbeReport([string[]] $scrapedEnvProbes) {
-
-        function AddListItem {
-            param(
-                [hashtable] $table,
-                [string] $key1,
-                [string] $key2,
-                [object] $obj
-            )
-
-            if (!$table.ContainsKey($key1)) {
-                $table[$key1] = @{}
+    $reader = [System.IO.StreamReader]::new($resolvedPath, [System.Text.Encoding]::UTF8)
+    try {
+        $buffer = [char[]]::new($MaxChars)
+        $totalRead = 0
+        while ($totalRead -lt $MaxChars) {
+            $readCount = $reader.Read($buffer, $totalRead, $MaxChars - $totalRead)
+            if ($readCount -le 0) {
+                break
             }
-            if (!$table[$key1].ContainsKey($key2)) {
-                $table[$key1][$key2] = @()
-            }
-            $table[$key1][$key2] += $obj
+            $totalRead += $readCount
         }
+        return [string]::new($buffer, 0, $totalRead)
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
 
-        $envReport = @{}
-        $operatorMap = @{
-            "NULL" = "unknown";
-            "eq" = "equals";
-            "ne" = "not equals"
-        }
+function Add-BoundedLinesToCollection {
+    param(
+        [string] $Path,
+        [object] $Target,
+        [long] $MaxBytes = 5242880
+    )
 
-        $probesSet = New-Object System.Collections.Generic.HashSet[string]
-
-        # first wrangle all the environment_probe actions we caught and split them by their goal
-        $this.Actions | ForEach-Object {
-
-            if ($_.Behaviors.Contains("environment_probe")) {
-                if ($_.SubBehaviors.Contains("probe_language")) {
-                    AddListItem $envReport "Language" "Actors" $_.Actor
-                }
-                elseif ($_.SubBehaviors.Contains("probe_host")) {
-                    AddListItem $envReport "Host" "Actors" $_.Actor
-                }
-                elseif ($_.SubBehaviors.Contains("probe_date")) {
-                    AddListItem $envReport "Date" "Actors" $_.Actor
-                }
-            }
-        }
-
-        # ingest the scraped environment probes and dedupe
-        foreach ($probe in $scrapedEnvProbes) {
-            $probesSet.Add($probe)
-        }
-
-        # split the probes out by goal and map to user-friendly representation of operator observed
-        foreach ($probeStr in $probesSet) {
-            $split = $probeStr.Split(",")
-            $probe = @{
-                "Value" = $split[1];
-                "Operator" = $operatorMap[$split[2]]
-            }
-            if ($split[0] -eq "language") {
-                AddListItem $envReport "Language" "Checks" $probe
-            }
-            elseif ($split[0] -eq "host") {
-                AddListItem $envReport "Host" "Checks" $probe
-            }
-            elseif ($split[0] -eq "date") {
-                AddListItem $envReport "Date" "Checks" $probe
-            }
-        }
-
-        return $envReport
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if (-not [System.IO.File]::Exists($resolvedPath)) {
+        return
     }
 
-    [hashtable] CombineScrapedIOCs([string[]] $scrapedNetwork, [string[]] $scrapedPaths) {
-
-        $pathsSet = New-Object System.Collections.Generic.HashSet[string]
-        $networkSet = New-Object System.Collections.Generic.HashSet[string]
-
-        # gather all file paths from actions
-        $this.Actions | Where-Object -Property Behaviors -contains "file_system" | ForEach-Object {
-            $($_.BehaviorProps.paths | ForEach-Object { $pathsSet.Add($_) > $null })
+    $reader = [System.IO.StreamReader]::new($resolvedPath, [System.Text.Encoding]::UTF8)
+    try {
+        [long] $bytesRead = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $bytesRead += [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
+            if ($line.Length -gt 0) {
+                [void]$Target.Add($line)
+            }
+            if ($bytesRead -ge $MaxBytes) {
+                break
+            }
         }
-
-        # gather all network urls from actions
-        $this.Actions | Where-Object -Property Behaviors -contains "network" | ForEach-Object {
-            $($_.BehaviorProps.uri | ForEach-Object { $networkSet.Add($_) > $null })
-        }
-
-        # add scraped paths and urls
-        if ($scrapedNetwork) {
-            $scrapedNetwork | ForEach-Object { $networkSet.Add($_) > $null }
-        }
-        if ($scrapedPaths) {
-            $scrapedPaths | ForEach-Object { $pathsSet.Add($_) > $null }
-        }
-
-        $paths = [string[]]::new($pathsSet.Count)
-        $network = [string[]]::new($networkSet.Count)
-        $networkSet.CopyTo($network)
-        $pathsSet.CopyTo($paths)
-
-        $result = @{
-            "network" = $network;
-            "file_system" = $paths
-        }
-
-        return $result
     }
+    finally {
+        $reader.Dispose()
+    }
+}
+
+function Add-EnvProbeListItem {
+    param(
+        [hashtable] $Table,
+        [string] $Key1,
+        [string] $Key2,
+        [object] $Obj
+    )
+
+    if (-not $Table.ContainsKey($Key1)) {
+        $Table[$Key1] = @{}
+    }
+    if (-not $Table[$Key1].ContainsKey($Key2)) {
+        $Table[$Key1][$Key2] = @()
+    }
+    $Table[$Key1][$Key2] += $Obj
 }
 
 # Isolates the script being executed in a powershell invocation. It may be written to be interpreted 
@@ -299,32 +255,28 @@ function HandleCmdInvocation {
 
     $action["BehaviorId"] = (Get-FileHash -InputStream $stringStream -Algorithm SHA256).Hash
 
-    $json = $action | ConvertTo-Json -Depth 10
-    ($json + ",") | Out-File -Append "$WORK_DIR/actions.json"
+    $json = $action | ConvertTo-Json -Depth 10 -Compress
+    $resolvedActionsPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("$WORK_DIR/actions.json")
+    [System.IO.File]::AppendAllText($resolvedActionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
 
     return $invokedScript
 }
 
 # For some reason, some piece of the powershell codebase behind the scenes is calling my Test-Path
 # override and that invocation is showing up in the actions. Haven't been able to track it down.
-function StripBugActions {
-
+function Test-IsBugAction {
     param(
-        [object[]] $Actions
+        [object] $Action
     )
 
-    $actions = $Actions | ForEach-Object {
-        if ($_.Actor -eq "Microsoft.PowerShell.Management\Test-Path") {
-            if ($_.BehaviorProps.paths -ne @("env:__SuppressAnsiEscapeSequences")) {
-                $_
-            }
-        }
-        else {
-            $_
-        }
+    if ($Action.Actor -ne "Microsoft.PowerShell.Management\Test-Path") {
+        return $false
     }
-
-    return $actions
+    if ($null -eq $Action.BehaviorProps -or $null -eq $Action.BehaviorProps.paths) {
+        return $false
+    }
+    $paths = @($Action.BehaviorProps.paths)
+    return ($paths.Count -eq 1 -and $paths[0] -eq "env:__SuppressAnsiEscapeSequences")
 }
 
 function HandleDirectlyWrittenFiles {
@@ -360,12 +312,12 @@ function HandleDirectlyWrittenFiles {
     }
 }
 
-# runs through the actions writing artifacts we may care about to disk and returns a map of which
-# actions by ID produced which artifact hash
-function HarvestArtifacts {
-
+# extracts artifacts from a single action, writes them to disk, and updates $ArtifactMap
+function HarvestSingleActionArtifacts {
     param(
-        [object[]] $Actions
+        [object] $Action,
+        [string] $ArtifactsDir,
+        [hashtable] $ArtifactMap
     )
 
     $behaviorMap = @{
@@ -374,87 +326,354 @@ function HarvestArtifacts {
         "binary_import" = "bytes";
     }
 
-    $supportedBehaviors = $behaviorMap.Keys
+    $actionBehaviors = @()
+    if ($null -ne $Action.Behaviors) { $actionBehaviors += $Action.Behaviors }
+    if ($null -ne $Action.SubBehaviors) { $actionBehaviors += $Action.SubBehaviors }
 
-    $artifactMap = @{}
+    if ($null -eq $Action.BehaviorProps) {
+        return
+    }
 
-    New-Item -Path $WORK_DIR/artifacts -ItemType "directory" > /dev/null 2>&1
-    $outDir = $WORK_DIR + "/artifacts/"
+    foreach ($behavior in $behaviorMap.Keys) {
+        if ($actionBehaviors -notcontains $behavior) {
+            continue
+        }
 
-    # Hacky handling for files directly written via obfuscated .NET
-    # object calls (box-ps can't override these methods so they
-    # actually run).
-    HandleDirectlyWrittenFiles
-    
-    # go through actions looking for behaviors that would give artifacts
-    foreach ($action in $Actions) {
+        $artifactProperty = $behaviorMap[$behavior]
+        $artifactContent = $Action.BehaviorProps."$artifactProperty"
+        if ($null -eq $artifactContent) {
+            continue
+        }
 
-        $actionBehaviors = $action.Behaviors + $action.SubBehaviors
-        $behaviors = $utils.ListIntersection($supportedBehaviors, $actionBehaviors)
+        # Could have a single element list where the content is
+        # actually the string in the list. Check for that.
+        $artifactIsArray = $artifactContent.GetType().BaseType.Name -eq "Array"
+        if ($artifactIsArray -and ($artifactContent.Length -eq 1) -and ($null -ne $artifactContent[0]) -and ($artifactContent[0].GetType().Name -eq "String")) {
+            $artifactIsArray = $false
+            $artifactContent = $artifactContent[0]
+        }
 
-        # go through behavior properties for those behaviors
-        foreach ($behavior in $behaviors) {
+        if ($artifactContent.Length -le 10) {
+            continue
+        }
 
-            $artifactProperty = $behaviorMap[$behavior]
-            $artifactContent = $action.BehaviorProps."$artifactProperty"
-            
-            if ($null -eq $artifactContent) {
+        $actionId = ($Action.Id | Out-String).Trim()
+        $fileType = "unknown"
+        $outPath = [System.IO.Path]::Combine($ArtifactsDir, "tmp.bin")
+
+        try {
+            # array content means bytes, assuming we'll never have an array of chars
+            if ($artifactIsArray) {
+                [System.IO.File]::WriteAllBytes($outPath, $artifactContent)
+            }
+            # content is just text
+            else {
+                $artifactContent | Out-File $outPath
+            }
+        }
+        catch {
+            [Console]::Error.WriteLine("[-] error writing artifact to disk from action ID $actionId : $($_.Exception)")
+            continue
+        }
+
+        $sha256 = (Get-FileHash -Path $outPath -Algorithm SHA256).Hash
+        Move-Item -Path $outPath -Destination ([System.IO.Path]::Combine($ArtifactsDir, $sha256)) -Force
+
+        # check if the bytes indicate a PE file
+        if ($artifactIsArray -and $artifactContent[0] -eq 77 -and $artifactContent[1] -eq 90) {
+            $fileType = "PE"
+        }
+
+        if (-not $ArtifactMap.Contains($actionId)) {
+            $ArtifactMap[$actionId] = @()
+        }
+
+        $ArtifactMap[$actionId] += @{
+            "sha256" = $sha256;
+            "fileType" = $fileType
+        }
+    }
+}
+
+function Update-ActionIndicatorsAndProbes {
+    param(
+        [object] $Action,
+        [System.Collections.Generic.HashSet[string]] $PathsSet,
+        [System.Collections.Generic.HashSet[string]] $NetworkSet,
+        [hashtable] $EnvReport
+    )
+
+    $behaviors = @()
+    if ($null -ne $Action.Behaviors) { $behaviors = @($Action.Behaviors) }
+    $subBehaviors = @()
+    if ($null -ne $Action.SubBehaviors) { $subBehaviors = @($Action.SubBehaviors) }
+
+    if ($behaviors -contains "file_system" -and $null -ne $Action.BehaviorProps -and $null -ne $Action.BehaviorProps.paths) {
+        foreach ($p in @($Action.BehaviorProps.paths)) {
+            if ($null -ne $p) {
+                [void]$PathsSet.Add([string]$p)
+            }
+        }
+    }
+
+    if ($behaviors -contains "network" -and $null -ne $Action.BehaviorProps -and $null -ne $Action.BehaviorProps.uri) {
+        foreach ($u in @($Action.BehaviorProps.uri)) {
+            if ($null -ne $u) {
+                [void]$NetworkSet.Add([string]$u)
+            }
+        }
+    }
+
+    if ($behaviors -contains "environment_probe") {
+        if ($subBehaviors -contains "probe_language") {
+            Add-EnvProbeListItem -Table $EnvReport -Key1 "Language" -Key2 "Actors" -Obj $Action.Actor
+        }
+        elseif ($subBehaviors -contains "probe_host") {
+            Add-EnvProbeListItem -Table $EnvReport -Key1 "Host" -Key2 "Actors" -Obj $Action.Actor
+        }
+        elseif ($subBehaviors -contains "probe_date") {
+            Add-EnvProbeListItem -Table $EnvReport -Key1 "Date" -Key2 "Actors" -Obj $Action.Actor
+        }
+    }
+}
+
+function Test-IsArtifactActionObj {
+    param(
+        [object] $Action
+    )
+
+    if ($null -eq $Action) {
+        return $false
+    }
+
+    $artifactBehaviors = @("write_to_memory", "file_write", "binary_import")
+    foreach ($b in (@($Action.Behaviors) + @($Action.SubBehaviors))) {
+        if ($null -ne $b -and $artifactBehaviors -contains $b) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-CompactedActionJson {
+    param(
+        [object] $Action,
+        [string] $RawJsonLine
+    )
+
+    if ($RawJsonLine.Length -le 65536) {
+        return $RawJsonLine
+    }
+
+    $compacted = $false
+    $maxStringChars = 16384
+
+    if ($null -ne $Action.BehaviorProps) {
+        foreach ($propName in @("bytes", "content")) {
+            $prop = $Action.BehaviorProps.PSObject.Properties[$propName]
+            if ($null -eq $prop -or $null -eq $prop.Value) {
                 continue
             }
-
-            # Could have a single element list where the content is
-            # actually the string in the list. Check for that.
-            $artifactIsArray = $artifactContent.GetType().BaseType.Name -eq "Array"
-            if ($artifactIsArray -and ($artifactContent.Length -eq 1) -and ($artifactContent[0].GetType().Name -eq "String")) {
-                $artifactIsArray = $false
-                $artifactContent = $artifactContent[0]
+            $val = $prop.Value
+            if ($val -is [System.Array] -and $val.Length -gt 8192) {
+                $prop.Value = "<truncated: $($val.Length) bytes; harvested as artifact>"
+                $compacted = $true
             }
-            $actionId = ($action.Id | Out-String).Trim()
-            $fileType = "unknown"
+            elseif ($val -is [string] -and $val.Length -gt 8192) {
+                $prop.Value = "<truncated: $($val.Length) bytes; harvested as artifact>"
+                $compacted = $true
+            }
+        }
 
-            # basic check to see if this may be interesting
-            if ($artifactContent.Length -gt 10) {
+        foreach ($prop in $Action.BehaviorProps.PSObject.Properties) {
+            $val = $prop.Value
+            if ($val -is [string] -and $val.Length -gt $maxStringChars) {
+                $prop.Value = $val.Substring(0, $maxStringChars) + "... <truncated: $($val.Length) chars>"
+                $compacted = $true
+            }
+        }
+    }
 
-                # write content and compute sha256
-                $outPath = $outDir + "tmp.bin"
-
-                try {
-                    # array content means bytes, assuming we'll never have an array of chars
-                    if ($artifactIsArray) {
-                        [System.IO.File]::WriteAllBytes($outPath, $artifactContent)
+    if ($null -ne $Action.Parameters) {
+        foreach ($paramProp in $Action.Parameters.PSObject.Properties) {
+            $val = $paramProp.Value
+            if ($null -eq $val) {
+                continue
+            }
+            if ($val -is [System.Array] -and $val.Length -gt 8192) {
+                $paramProp.Value = "<truncated: $($val.Length) bytes; harvested as artifact>"
+                $compacted = $true
+            }
+            elseif ($val -is [string] -and $val.Length -gt 8192 -and $paramProp.Name -in @("bytes", "content", "contents", "Value")) {
+                $paramProp.Value = "<truncated: $($val.Length) bytes; harvested as artifact>"
+                $compacted = $true
+            }
+            elseif ($val -is [string] -and $val.Length -gt $maxStringChars) {
+                $paramProp.Value = $val.Substring(0, $maxStringChars) + "... <truncated: $($val.Length) chars>"
+                $compacted = $true
+            }
+            elseif ($val -is [System.Array]) {
+                for ($i = 0; $i -lt $val.Length; $i++) {
+                    if ($val[$i] -is [string] -and $val[$i].Length -gt $maxStringChars) {
+                        $val[$i] = $val[$i].Substring(0, $maxStringChars) + "... <truncated: $($val[$i].Length) chars>"
+                        $compacted = $true
                     }
-                    # content is just text
-                    else {
-                        $artifactContent | Out-File $outPath
-                    }
-                }
-                catch {
-                    [Console]::Error.WriteLine("[-] error writing artifact to disk from action ID $actionId : $($_.Exception)")
-                    continue
-                }
-
-                # compute sha256 hash, move to artifact directory
-                $sha256 = $(Get-FileHash -Path $outPath -Algorithm SHA256).Hash
-                Move-Item -Path $outPath -Destination ($outDir + $sha256) -Force
-
-                # check if the bytes indicate a PE file
-                if ($artifactIsArray -and $artifactContent[0] -eq 77 -and $artifactContent[1] -eq 90) {
-                    $fileType = "PE"
-                }
-
-                if (!$artifactMap.Contains($actionId)) {
-                    $artifactMap[$actionId] = @()
-                }
-
-                $artifactMap[$actionId] += @{
-                    "sha256" = $sha256;
-                    "fileType" = $fileType
                 }
             }
         }
     }
 
-    return $artifactMap
+    if ($compacted) {
+        $depth = if ($Action.Actor -eq "powershell.exe") { 10 } else { 5 }
+        return ($Action | ConvertTo-Json -Depth $depth -Compress)
+    }
+
+    return $RawJsonLine
+}
+
+function Write-StreamingReport {
+    param(
+        [string] $WorkDir,
+        [string] $ActionsPath,
+        [string] $ReportOutPath,
+        [long] $MaxReportActions
+    )
+
+    $artifactsDir = "$WorkDir/artifacts"
+    New-Item -Path $artifactsDir -ItemType "directory" > $null 2>&1
+    $resolvedArtifactsDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($artifactsDir)
+
+    # Hacky handling for files directly written via obfuscated .NET
+    # object calls (box-ps can't override these methods so they actually run).
+    HandleDirectlyWrittenFiles
+
+    $artifactMap = @{}
+    $pathsSet = [System.Collections.Generic.HashSet[string]]::new()
+    $networkSet = [System.Collections.Generic.HashSet[string]]::new()
+    $envReport = @{}
+
+    $resolvedActionsPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ActionsPath)
+    $resolvedReportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportOutPath)
+    $maxArtifactActions = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ARTIFACT_ACTIONS" -Default 100
+
+    $writer = [System.IO.StreamWriter]::new($resolvedReportPath, $false, [System.Text.UTF8Encoding]::new($false))
+    try {
+        $writer.Write('{"Actions":[')
+        $firstAction = $true
+        [long] $writtenActions = 0
+        [long] $writtenArtifactActions = 0
+
+        if ([System.IO.File]::Exists($resolvedActionsPath)) {
+            $reader = [System.IO.StreamReader]::new($resolvedActionsPath, [System.Text.Encoding]::UTF8)
+            try {
+                while ($null -ne ($rawLine = $reader.ReadLine())) {
+                    $trimmed = $rawLine.Trim()
+                    if ($trimmed.EndsWith(",")) {
+                        $trimmed = $trimmed.Substring(0, $trimmed.Length - 1).TrimEnd()
+                    }
+                    if ([string]::IsNullOrEmpty($trimmed)) {
+                        continue
+                    }
+
+                    $action = $null
+                    try {
+                        $action = $trimmed | ConvertFrom-Json
+                    }
+                    catch {
+                        [Console]::Error.WriteLine("[!] box-ps skipping malformed action entry: $($_.Exception.Message)")
+                        continue
+                    }
+                    if ($null -eq $action) {
+                        continue
+                    }
+
+                    if (Test-IsBugAction -Action $action) {
+                        continue
+                    }
+
+                    # Harvest artifacts before compacting oversized properties in memory
+                    HarvestSingleActionArtifacts -Action $action -ArtifactsDir $resolvedArtifactsDir -ArtifactMap $artifactMap
+                    Update-ActionIndicatorsAndProbes -Action $action -PathsSet $pathsSet -NetworkSet $networkSet -EnvReport $envReport
+
+                    $emitAction = $false
+                    if ($writtenActions -lt $MaxReportActions) {
+                        $emitAction = $true
+                        $writtenActions++
+                    }
+                    elseif ((Test-IsArtifactActionObj -Action $action) -and $writtenArtifactActions -lt $maxArtifactActions) {
+                        $emitAction = $true
+                        $writtenArtifactActions++
+                    }
+
+                    if ($emitAction) {
+                        $lineToWrite = Get-CompactedActionJson -Action $action -RawJsonLine $trimmed
+                        if (-not $firstAction) {
+                            $writer.Write(",")
+                        }
+                        $writer.Write($lineToWrite)
+                        $firstAction = $false
+                    }
+                }
+            }
+            finally {
+                $reader.Dispose()
+            }
+        }
+
+        $writer.Write("]")
+
+        $maxScrapedBytes = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_SCRAPED_BYTES" -Default 5242880
+        Add-BoundedLinesToCollection -Path "$WorkDir/scraped_network.txt" -Target $networkSet -MaxBytes $maxScrapedBytes
+        Add-BoundedLinesToCollection -Path "$WorkDir/scraped_paths.txt" -Target $pathsSet -MaxBytes $maxScrapedBytes
+
+        $probesSet = [System.Collections.Generic.HashSet[string]]::new()
+        Add-BoundedLinesToCollection -Path "$WorkDir/scraped_probes.txt" -Target $probesSet -MaxBytes $maxScrapedBytes
+
+        $operatorMap = @{
+            "NULL" = "unknown";
+            "eq" = "equals";
+            "ne" = "not equals"
+        }
+        foreach ($probeStr in $probesSet) {
+            $split = $probeStr.Split(",")
+            if ($split.Length -ge 3) {
+                $probe = @{
+                    "Value" = $split[1];
+                    "Operator" = $operatorMap[$split[2]]
+                }
+                if ($split[0] -eq "language") {
+                    Add-EnvProbeListItem -Table $envReport -Key1 "Language" -Key2 "Checks" -Obj $probe
+                }
+                elseif ($split[0] -eq "host") {
+                    Add-EnvProbeListItem -Table $envReport -Key1 "Host" -Key2 "Checks" -Obj $probe
+                }
+                elseif ($split[0] -eq "date") {
+                    Add-EnvProbeListItem -Table $envReport -Key1 "Date" -Key2 "Checks" -Obj $probe
+                }
+            }
+        }
+
+        $potentialArtifactsList = [System.Collections.Generic.List[string]]::new()
+        Add-BoundedLinesToCollection -Path "$WorkDir/in_mem_pes.txt" -Target $potentialArtifactsList -MaxBytes $maxScrapedBytes
+
+        $networkJson = ConvertTo-Json -InputObject ([string[]]$networkSet) -Depth 2 -Compress
+        $pathsJson = ConvertTo-Json -InputObject ([string[]]$pathsSet) -Depth 2 -Compress
+        $envReportJson = ConvertTo-Json -InputObject $envReport -Depth 5 -Compress
+        $artifactsJson = ConvertTo-Json -InputObject $artifactMap -Depth 5 -Compress
+        $potentialArtifactsJson = ConvertTo-Json -InputObject ([string[]]$potentialArtifactsList) -Depth 2 -Compress
+        $workingDirJson = ConvertTo-Json -InputObject $WorkDir -Compress
+
+        $writer.Write(",`"PotentialIndicators`":{`"network`":$networkJson,`"file_system`":$pathsJson}")
+        $writer.Write(",`"EnvironmentProbes`":$envReportJson")
+        $writer.Write(",`"Artifacts`":$artifactsJson")
+        $writer.Write(",`"PotentialArtifacts`":$potentialArtifactsJson")
+        $writer.Write(",`"WorkingDir`":$workingDirJson")
+        $writer.Write("}")
+        $writer.Flush()
+    }
+    finally {
+        $writer.Dispose()
+    }
 }
 
 # clean up working directory if desired, remove imported modules, and exit with a code
@@ -670,36 +889,99 @@ else {
     Write-Host " done"
     Write-Host -NoNewLine "[+] sandboxing harnessed script..."
 
-    # run it in another shell
+    # Run sandboxed script via ProcessStartInfo.ArgumentList (avoids Start-Process space-splitting bugs
+    # and drains stdout/stderr streams asynchronously so pipes never deadlock).
+    $resolvedStdoutPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($stdoutPath)
+    $resolvedStderrPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($stderrPath)
+    $resolvedHarnessedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($harnessedScriptPath)
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+
     if ($Timeout) {
-        (timeout --foreground $Timeout pwsh -noni $harnessedScriptPath 2> $stderrPath 1> $stdoutPath)
+        $psi.FileName = "timeout"
+        [void]$psi.ArgumentList.Add("--foreground")
+        [void]$psi.ArgumentList.Add($Timeout)
+        [void]$psi.ArgumentList.Add("pwsh")
+        [void]$psi.ArgumentList.Add("-noni")
+        [void]$psi.ArgumentList.Add($resolvedHarnessedPath)
     }
     else {
-        pwsh -noni $harnessedScriptPath 2> $stderrPath 1> $stdoutPath
+        $psi.FileName = "pwsh"
+        [void]$psi.ArgumentList.Add("-noni")
+        [void]$psi.ArgumentList.Add($resolvedHarnessedPath)
+    }
+
+    $proc = $null
+    $stdoutFs = $null
+    $stderrFs = $null
+    $innerExitCode = -1
+    $startError = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if ($null -eq $proc) {
+            throw "Process.Start returned null for $($psi.FileName)"
+        }
+        $stdoutFs = [System.IO.FileStream]::new($resolvedStdoutPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $stderrFs = [System.IO.FileStream]::new($resolvedStderrPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+
+        $stdoutTask = $proc.StandardOutput.BaseStream.CopyToAsync($stdoutFs)
+        $stderrTask = $proc.StandardError.BaseStream.CopyToAsync($stderrFs)
+
+        $proc.WaitForExit()
+        [void]$stdoutTask.GetAwaiter().GetResult()
+        [void]$stderrTask.GetAwaiter().GetResult()
+        $innerExitCode = $proc.ExitCode
+    }
+    catch {
+        $startError = $_.Exception.Message
+    }
+    finally {
+        if ($null -ne $stdoutFs) { $stdoutFs.Dispose() }
+        if ($null -ne $stderrFs) { $stderrFs.Dispose() }
+        if ($null -ne $proc) { $proc.Dispose() }
+    }
+
+    if ($null -ne $startError) {
+        [Console]::Error.WriteLine("[-] sandboxing failed: unable to execute sandboxed process: $startError")
+        CleanExit -NoCleanUp $NoCleanUp -WorkDir $WORK_DIR -ExitCode 4
     }
 
     Write-Host " done"
 
     # check for some indicators of sandboxing failure
-    $stderr = Get-Content -Raw $stderrPath
+    $stderr = ReadBoundedText -Path $stderrPath -MaxChars 262144
     $fail = $false
     $errorReason = ""
     $errorCode = 4
 
-    # detect some critical errors from the stderr of the sandbox process
-
-    # check for timeout
-    if ($LASTEXITCODE -eq 124) {
+    # detect some critical errors from the exit code and stderr of the sandbox process
+    if ($innerExitCode -eq 124) {
         $fail = $true
         $errorReason = "sandboxing timed out"
         $errorCode = 124
     }
-
-    # indicates a script with invalid syntax
-    if ($null -ne $stderr -and $stderr.Contains("ParserError: ")) {
+    elseif ($innerExitCode -in @(125, 126, 127)) {
         $fail = $true
-        $errorReason = "invalid script syntax"
-        $errorCode = 6
+        $errorReason = "sandbox timeout wrapper failed (exit code $innerExitCode)"
+        $errorCode = $innerExitCode
+    }
+    elseif ($null -ne $stderr -and $stderr.Contains("OutOfMemoryException")) {
+        $fail = $true
+        $errorReason = "sandboxed process ran out of memory"
+        $errorCode = 137
+    }
+    elseif ($innerExitCode -gt 128) {
+        $fail = $true
+        $errorReason = "sandboxed process terminated by signal (exit code $innerExitCode)"
+        $errorCode = $innerExitCode
+    }
+    elseif ($null -ne $stderr -and $stderr.Contains("ParserError: ")) {
+        [Console]::Error.WriteLine("[!] parser error encountered in sample; proceeding with extracted layers and indicators")
     }
 
     # print error and exit
@@ -711,45 +993,11 @@ else {
 
     Write-Host -NoNewLine "[+] post-processing results..."
 
-    # ingest the recorded actions
-    $actionsJson = Get-Content -Raw $actionsPath
-    if ($null -eq $actionsJson) {
-        $actionsJson = ""
-    }
-
-    $actions = "[" + $actionsJson.TrimEnd(",`r`n") + "]" | ConvertFrom-Json
-    if ($null -eq $actions) {
-        $actions = @()
-    }
-    $actions = $(StripBugActions $actions)
-    
-    # go gather the IOCs we may have scraped
-    $scrapedNetwork = Get-Content $WORK_DIR/scraped_network.txt -ErrorAction SilentlyContinue
-    $scrapedPaths = Get-Content $WORK_DIR/scraped_paths.txt -ErrorAction SilentlyContinue
-    $scrapedEnvProbes = Get-Content $WORK_DIR/scraped_probes.txt -ErrorAction SilentlyContinue
-
-    # write out artifacts of the script from actions data
-    $artifactMap = HarvestArtifacts $actions
-
-    # record the PEs found from variables content
-    if (Test-Path $WORK_DIR/in_mem_pes.txt) {
-        $potentialArtifacts = [string[]](Get-Content $WORK_DIR/in_mem_pes.txt)
-    }
-    else {
-        $potentialArtifacts = @()
-    }
-
-    # create the report and convert to JSON
-    $report = [Report]::new($actions, $scrapedNetwork, $scrapedPaths, 
-        $scrapedEnvProbes, $artifactMap, $potentialArtifacts, $WORK_DIR)
-    $reportJson = $report | ConvertTo-Json -Depth 10
+    $maxReportActions = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ACTIONS" -Default 2000
+    $reportTmpPath = "$WORK_DIR/report.json"
+    Write-StreamingReport -WorkDir $WORK_DIR -ActionsPath $actionsPath -ReportOutPath $reportTmpPath -MaxReportActions $maxReportActions
 
     Write-Host " done"
-
-    # output the JSON report where the user wants it
-    if ($OutFile) {
-        $reportJson | Out-File $OutFile
-    }
 
     # user wants more detailed artifacts as well as the report
     if ($OutDir) {
@@ -774,7 +1022,19 @@ else {
             Move-Item $WORK_DIR/untracked_artifacts $OutDir
         }
 
-        $reportJson | Out-File $OutDir/report.json
+        $outReportPath = Join-Path $OutDir "report.json"
+        Move-Item -Path $reportTmpPath -Destination $outReportPath -Force
+
+        if ($OutFile) {
+            $resolvedOutFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
+            $resolvedOutReport = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outReportPath)
+            if ($resolvedOutFile -ne $resolvedOutReport) {
+                Copy-Item -Path $outReportPath -Destination $OutFile -Force
+            }
+        }
+    }
+    elseif ($OutFile) {
+        Copy-Item -Path $reportTmpPath -Destination $OutFile -Force
     }
 
     CleanExit -NoCleanUp $NoCleanUp -WorkDir $WORK_DIR -ExitCode 0

@@ -694,7 +694,7 @@ function ConvertTo-Json {
 	[Object] $InputObject
     )
 
-    if ($InputObject.GetType() -eq [Action] -and $InputObject.Parameters["startInfo"]) {
+    if ($null -ne $InputObject -and $InputObject.GetType() -eq [Action] -and $null -ne $InputObject.Parameters -and $InputObject.Parameters["startInfo"]) {
 
         $startInfo = $InputObject.Parameters["startInfo"]
 
@@ -728,7 +728,13 @@ function ConvertTo-Json {
         $object = Microsoft.PowerShell.Utility\New-Object psObject -Property $objectDict
         $InputObject.Parameters["startInfo"] = $object
 
-        return $InputObject | Microsoft.PowerShell.Utility\ConvertTo-Json
+        $forwardParams = @{}
+        foreach ($key in $PSBoundParameters.Keys) {
+            if ($key -ne "InputObject") {
+                $forwardParams[$key] = $PSBoundParameters[$key]
+            }
+        }
+        return ($InputObject | Microsoft.PowerShell.Utility\ConvertTo-Json @forwardParams)
     }
 
     return Microsoft.PowerShell.Utility\ConvertTo-Json @PSBoundParameters

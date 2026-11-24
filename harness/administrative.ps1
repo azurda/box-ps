@@ -50,6 +50,29 @@ $global:WORK_DIR = $WORK_DIR
 $CODE_DIR = "<CODE_DIR>"
 $BOXPS_CONFIG = Microsoft.PowerShell.Management\Get-Content "$CODE_DIR/config.json" | ConvertFrom-Json -AsHashtable
 
+function Get-BoxPSPositiveIntEnv {
+    param(
+        [string] $Name,
+        [long] $Default
+    )
+
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    [long] $parsed = 0
+    if (-not [string]::IsNullOrWhiteSpace($raw) -and [long]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) {
+        return $parsed
+    }
+    return $Default
+}
+
+$script:BOXPS_MAX_ACTIONS = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ACTIONS" -Default 2000
+$script:BOXPS_MAX_ACTIONS_BYTES = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ACTIONS_BYTES" -Default 20971520
+$script:BOXPS_MAX_REPEAT_BEHAVIOR = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_REPEAT_BEHAVIOR" -Default 10
+$script:BOXPS_MAX_ARTIFACT_ACTIONS = Get-BoxPSPositiveIntEnv -Name "BOXPS_MAX_ARTIFACT_ACTIONS" -Default 100
+$script:BOXPS_BEHAVIOR_COUNTS = @{}
+$script:BOXPS_ACTION_COUNT = 0
+$script:BOXPS_ARTIFACT_ACTION_COUNT = 0
+$script:BOXPS_TRUNCATED = $false
+
 class Action <# lawsuit... I'll be here all week #> {
 
     [String[]] $Behaviors
@@ -164,22 +187,85 @@ class Action <# lawsuit... I'll be here all week #> {
     }
 }
 
+function Test-IsArtifactAction {
+    param(
+        [Action] $Action
+    )
+
+    if ($null -eq $Action) {
+        return $false
+    }
+
+    $artifactBehaviors = @("write_to_memory", "file_write", "binary_import")
+    foreach ($b in (@($Action.Behaviors) + @($Action.SubBehaviors))) {
+        if ($null -ne $b -and $artifactBehaviors -contains $b) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function RecordAction {
 
     param(
         [Action] $Action
     )
-    
+
+    $bid = if ($null -ne $Action.BehaviorId) { $Action.BehaviorId } else { "" }
+    $prevCount = 0
+    if ($script:BOXPS_BEHAVIOR_COUNTS.ContainsKey($bid)) {
+        $prevCount = [int]$script:BOXPS_BEHAVIOR_COUNTS[$bid]
+    }
+    if ($prevCount -ge $script:BOXPS_MAX_REPEAT_BEHAVIOR) {
+        return
+    }
+
     $wd = $WORK_DIR
     if ($null -eq $wd -or $wd -eq "") { $wd = $global:WORK_DIR }
     if ($null -eq $wd -or $wd -eq "") { $wd = "." }
+
+    $resolvedWd = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($wd)
+    $actionsPath = [System.IO.Path]::Combine($resolvedWd, "actions.json")
+
+    [long] $actionsSize = 0
+    if ([System.IO.File]::Exists($actionsPath)) {
+        $actionsSize = ([System.IO.FileInfo]::new($actionsPath)).Length
+    }
+    $byteLimitReached = ($actionsSize -ge $script:BOXPS_MAX_ACTIONS_BYTES)
+    if ($script:BOXPS_TRUNCATED -or $script:BOXPS_ACTION_COUNT -ge $script:BOXPS_MAX_ACTIONS -or $byteLimitReached) {
+        $canExemptArtifact = (Test-IsArtifactAction -Action $Action) -and `
+            ($script:BOXPS_ARTIFACT_ACTION_COUNT -lt $script:BOXPS_MAX_ARTIFACT_ACTIONS) -and `
+            ($actionsSize -lt ($script:BOXPS_MAX_ACTIONS_BYTES * 2))
+        if ($canExemptArtifact) {
+            $script:BOXPS_ARTIFACT_ACTION_COUNT++
+        }
+        else {
+            if (-not $script:BOXPS_TRUNCATED) {
+                $script:BOXPS_TRUNCATED = $true
+                [Console]::Error.WriteLine("[!] box-ps action trace cap reached; truncating further action entries.")
+                [System.IO.File]::WriteAllText(
+                    [System.IO.Path]::Combine($resolvedWd, "actions_truncated.txt"),
+                    "truncated",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
+            return
+        }
+    }
+
+    $script:BOXPS_BEHAVIOR_COUNTS[$bid] = $prevCount + 1
+    $script:BOXPS_ACTION_COUNT++
 
     # read and update the running action id on disk
     $Action.Id = [int](Microsoft.PowerShell.Management\Get-Content -Raw "$wd/action_id.txt")
     ($Action.Id + 1) | Out-File "$wd/action_id.txt"
 
-    $json = $Action | ConvertTo-Json -Depth 5
-    ($json + ",") | Out-File -Append "$wd/actions.json"
+    $json = $Action | ConvertTo-Json -Depth 5 -Compress
+    # manual_cmdlets.ps1's ConvertTo-Json startInfo branch omits -Compress; normalize to single-line NDJSON
+    if ($null -ne $json -and ($json.IndexOf("`n") -ge 0 -or $json.IndexOf("`r") -ge 0)) {
+        $json = ($json | Microsoft.PowerShell.Utility\ConvertFrom-Json | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 5 -Compress)
+    }
+    [System.IO.File]::AppendAllText($actionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
 }
 
 function RedirectObjectCreation {

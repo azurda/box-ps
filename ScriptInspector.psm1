@@ -548,6 +548,80 @@ function ScrapeLanguageProbes {
 	return $probes
 }
 
+function Get-InspectorPositiveIntEnv {
+    param(
+        [string] $Name,
+        [long] $Default
+    )
+
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    [long] $parsed = 0
+    if (-not [string]::IsNullOrWhiteSpace($raw) -and [long]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) {
+        return $parsed
+    }
+    return $Default
+}
+
+$script:BOXPS_MAX_SCRAPED_BYTES = Get-InspectorPositiveIntEnv -Name "BOXPS_MAX_SCRAPED_BYTES" -Default 5242880
+$script:BOXPS_MAX_LAYERS_BYTES = Get-InspectorPositiveIntEnv -Name "BOXPS_MAX_LAYERS_BYTES" -Default 10485760
+$script:BOXPS_TRUNCATED_FILES = @{}
+
+function AppendBoundedFile {
+    param(
+        [string] $Path,
+        [string[]] $Lines,
+        [long] $MaxBytes,
+        [string] $TruncationComment = ""
+    )
+
+    if ($null -eq $Lines -or $Lines.Count -eq 0) {
+        return
+    }
+
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if ($script:BOXPS_TRUNCATED_FILES.ContainsKey($resolvedPath)) {
+        return
+    }
+
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    [long] $currentLen = 0
+    if ([System.IO.File]::Exists($resolvedPath)) {
+        $currentLen = ([System.IO.FileInfo]::new($resolvedPath)).Length
+    }
+
+    $remaining = $MaxBytes - $currentLen
+    if ($remaining -le 0) {
+        $script:BOXPS_TRUNCATED_FILES[$resolvedPath] = $true
+        if (-not [string]::IsNullOrEmpty($TruncationComment)) {
+            [System.IO.File]::AppendAllText($resolvedPath, $TruncationComment + "`n", $utf8)
+        }
+        return
+    }
+
+    $content = ($Lines -join "`n") + "`n"
+    $bytes = $utf8.GetBytes($content)
+    if ($bytes.Length -le $remaining) {
+        [System.IO.File]::AppendAllText($resolvedPath, $content, $utf8)
+        return
+    }
+
+    [int] $writeLen = [int]$remaining
+    # Back off from the middle of a multi-byte UTF-8 sequence to avoid corrupting characters.
+    while ($writeLen -gt 0 -and ($bytes[$writeLen] -band 0xC0) -eq 0x80) {
+        $writeLen--
+    }
+
+    $truncatedContent = $utf8.GetString($bytes, 0, $writeLen)
+    $script:BOXPS_TRUNCATED_FILES[$resolvedPath] = $true
+    if (-not [string]::IsNullOrEmpty($TruncationComment)) {
+        if ($truncatedContent.Length -gt 0 -and -not $truncatedContent.EndsWith("`n")) {
+            $truncatedContent += "`n"
+        }
+        $truncatedContent += $TruncationComment + "`n"
+    }
+    [System.IO.File]::AppendAllText($resolvedPath, $truncatedContent, $utf8)
+}
+
 # code modifications to integrate it with the overrides
 # recording layer for output
 # scrape potential IOCs
@@ -559,14 +633,15 @@ function PreProcessScript {
     )
 
     # Do any rewrites of the initial script to help sandboxing.
-    $script = $utils.RewriteCode($script)    
-    ScrapeNetworkIOCs $Script | Microsoft.PowerShell.Utility\Out-File -Append "./working_$BoxPSPID/scraped_network.txt" 
-    ScrapeFilePaths $Script | Microsoft.PowerShell.Utility\Out-File -Append "./working_$BoxPSPID/scraped_paths.txt"
-    ScrapeEnvironmentProbes $Script | Microsoft.PowerShell.Utility\Out-File -Append "./working_$BoxPSPID/scraped_probes.txt"
+    $script = $utils.RewriteCode($script)
+    $workDir = "./working_$BoxPSPID"
+    AppendBoundedFile -Path "$workDir/scraped_network.txt" -Lines (ScrapeNetworkIOCs $Script) -MaxBytes $script:BOXPS_MAX_SCRAPED_BYTES
+    AppendBoundedFile -Path "$workDir/scraped_paths.txt" -Lines (ScrapeFilePaths $Script) -MaxBytes $script:BOXPS_MAX_SCRAPED_BYTES
+    AppendBoundedFile -Path "$workDir/scraped_probes.txt" -Lines (ScrapeEnvironmentProbes $Script) -MaxBytes $script:BOXPS_MAX_SCRAPED_BYTES
 
     $separator = ("*" * 100 + "`r`n")
     $layerOut = $separator + $Script + "`r`n" + $separator
-    $layerOut | Microsoft.PowerShell.Utility\Out-File -Append -Path "./working_$BoxPSPID/layers.ps1"
+    AppendBoundedFile -Path "$workDir/layers.ps1" -Lines @($layerOut) -MaxBytes $script:BOXPS_MAX_LAYERS_BYTES -TruncationComment "# [!] box-ps layers.ps1 cap reached; further layers truncated."
 
     return (BoxifyScript $Script)
 }
